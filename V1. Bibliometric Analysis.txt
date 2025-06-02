@@ -1,0 +1,357 @@
+# Comprehensive Bibliometric Analysis for Google Colab
+# This script analyzes merged bibliometric data and generates various visualizations
+
+# Install required packages
+!pip install pandas numpy matplotlib seaborn plotly networkx wordcloud pyvis
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import networkx as nx
+from wordcloud import WordCloud
+from collections import Counter
+import re
+from google.colab import files
+import json
+from pyvis.network import Network
+
+# Set display options
+pd.set_option('display.max_colwidth', None)
+plt.style.use('seaborn-v0_8-darkgrid')
+
+# Upload and read the merged bibliometric data
+print("Please upload your merged bibliometric CSV file")
+uploaded = files.upload()
+filename = next(iter(uploaded.keys()))
+df = pd.read_csv(filename)
+
+print(f"Loaded {len(df)} records")
+print("\nColumns available:", df.columns.tolist())
+
+# 1. Basic Statistics
+print("\n=== BASIC STATISTICS ===")
+print(f"Total publications: {len(df)}")
+print(f"Date range: {df['PY'].min()} to {df['PY'].max()}")
+print(f"Average citations per paper: {df['TC'].mean():.2f}")
+print(f"Total citations: {df['TC'].sum()}")
+
+# 2. Source Distribution
+print("\n=== SOURCE DISTRIBUTION ===")
+source_counts = df['SRC'].value_counts()
+print(source_counts)
+
+# 3. Publication Trends Over Time
+fig = go.Figure()
+
+# Publications by year
+year_counts = df['PY'].value_counts().sort_index()
+fig.add_trace(go.Scatter(x=year_counts.index, y=year_counts.values,
+                         mode='lines+markers', name='Publications',
+                         line=dict(color='rgb(55, 83, 109)', width=3)))
+
+# Add cumulative curve
+cumulative = year_counts.cumsum()
+fig.add_trace(go.Scatter(x=cumulative.index, y=cumulative.values,
+                         mode='lines', name='Cumulative',
+                         line=dict(color='rgb(255, 153, 51)', width=2)))
+
+fig.update_layout(title='Publication Trends Over Time',
+                  xaxis_title='Year',
+                  yaxis_title='Number of Publications',
+                  hovermode='x unified')
+fig.show()
+
+# 4. Most Productive Authors
+print("\n=== MOST PRODUCTIVE AUTHORS ===")
+# Extract first author from author field
+df['First_Author'] = df['AU'].apply(lambda x: x.split(';')[0] if pd.notna(x) else 'Unknown')
+top_authors = df['First_Author'].value_counts().head(20)
+print(top_authors)
+
+# Create author productivity chart
+fig = px.bar(x=top_authors.values, y=top_authors.index, orientation='h',
+             title='Top 20 Most Productive Authors',
+             labels={'x': 'Number of Publications', 'y': 'Author'})
+fig.update_layout(yaxis_title='Author', xaxis_title='Number of Publications')
+fig.show()
+
+# 5. Citation Analysis
+print("\n=== CITATION ANALYSIS ===")
+# Citation distribution
+plt.figure(figsize=(10, 6))
+plt.hist(df['TC'], bins=50, edgecolor='black', alpha=0.7)
+plt.xlabel('Citations')
+plt.ylabel('Frequency')
+plt.title('Citation Distribution')
+plt.yscale('log')
+plt.show()
+
+# Top cited papers
+print("\nTop 10 Most Cited Papers:")
+top_cited = df.nlargest(10, 'TC')[['TI', 'AU', 'PY', 'TC', 'SO']]
+print(top_cited.to_string())
+
+# 6. Journal Analysis
+print("\n=== JOURNAL ANALYSIS ===")
+# Top journals
+top_journals = df['SO'].value_counts().head(15)
+print("\nTop 15 Journals:")
+print(top_journals)
+
+# Journal citation impact
+journal_impact = df.groupby('SO').agg({
+    'TC': ['count', 'sum', 'mean']
+}).sort_values(('TC', 'mean'), ascending=False).head(10)
+journal_impact.columns = ['Publications', 'Total_Citations', 'Avg_Citations']
+print("\nTop 10 Journals by Average Citations:")
+print(journal_impact)
+
+# 7. Keyword Analysis
+def extract_keywords(keyword_str):
+    if pd.isna(keyword_str):
+        return []
+    return [kw.strip() for kw in str(keyword_str).split(';')]
+
+# Combine author and index keywords
+all_keywords = []
+for _, row in df.iterrows():
+    keywords = extract_keywords(row['DE']) + extract_keywords(row['ID_KW'])
+    all_keywords.extend(keywords)
+
+# Count keywords
+keyword_counts = Counter(all_keywords)
+top_keywords = dict(keyword_counts.most_common(50))
+
+print("\n=== KEYWORD ANALYSIS ===")
+print("Top 20 Keywords:")
+for keyword, count in list(top_keywords.items())[:20]:
+    print(f"{keyword}: {count}")
+
+# Create word cloud
+wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(top_keywords)
+plt.figure(figsize=(15, 8))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis('off')
+plt.title('Keyword Cloud')
+plt.show()
+
+# 8. Co-authorship Network Analysis
+def extract_authors(author_str):
+    if pd.isna(author_str):
+        return []
+    return [a.strip() for a in author_str.split(';')]
+
+# Build co-authorship network
+G = nx.Graph()
+for _, row in df.iterrows():
+    authors = extract_authors(row['AU'])
+    for i, author1 in enumerate(authors):
+        for author2 in authors[i+1:]:
+            if G.has_edge(author1, author2):
+                G[author1][author2]['weight'] += 1
+            else:
+                G.add_edge(author1, author2, weight=1)
+
+# Analyze network
+print("\n=== CO-AUTHORSHIP NETWORK ===")
+print(f"Number of authors: {G.number_of_nodes()}")
+print(f"Number of collaborations: {G.number_of_edges()}")
+print(f"Density: {nx.density(G):.4f}")
+
+# Find most connected authors
+degree_centrality = nx.degree_centrality(G)
+top_connected = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)[:10]
+print("\nTop 10 Most Connected Authors:")
+for author, centrality in top_connected:
+    print(f"{author}: {centrality:.4f}")
+
+# Visualize co-authorship network (small subset)
+# Extract largest connected component
+largest_cc = max(nx.connected_components(G), key=len)
+G_sub = G.subgraph(largest_cc)
+
+# Further reduce for visualization
+if len(G_sub) > 100:
+    # Keep only highly connected nodes
+    degrees = dict(G_sub.degree())
+    high_degree_nodes = [node for node, degree in degrees.items() if degree >= 3]
+    G_sub = G_sub.subgraph(high_degree_nodes)
+
+# Create interactive visualization
+net = Network(height='600px', width='100%', bgcolor='#222222', font_color='white')
+net.from_nx(G_sub)
+net.save_graph("coauthorship_network.html")
+files.download("coauthorship_network.html")
+
+# 9. Citation Network
+# Simplified citation network based on common keywords
+print("\n=== CITATION NETWORK ANALYSIS ===")
+# Create paper similarity network based on shared keywords
+papers = df[['TI', 'DE', 'ID_KW']].copy()
+papers['keywords'] = papers.apply(lambda x: extract_keywords(x['DE']) + extract_keywords(x['ID_KW']), axis=1)
+
+# Create similarity matrix
+similarity_threshold = 3  # minimum shared keywords
+citation_net = nx.Graph()
+
+for i, paper1 in papers.iterrows():
+    for j, paper2 in papers.iterrows():
+        if i < j:
+            shared_keywords = len(set(paper1['keywords']) & set(paper2['keywords']))
+            if shared_keywords >= similarity_threshold:
+                citation_net.add_edge(paper1['TI'][:50], paper2['TI'][:50], weight=shared_keywords)
+
+print(f"Number of papers in citation network: {citation_net.number_of_nodes()}")
+print(f"Number of connections: {citation_net.number_of_edges()}")
+
+# 10. Bradford's Law Analysis
+print("\n=== BRADFORD'S LAW ANALYSIS ===")
+# Rank journals by publications
+journal_ranks = df['SO'].value_counts().reset_index()
+journal_ranks.columns = ['Journal', 'Publications']
+journal_ranks['Cumulative'] = journal_ranks['Publications'].cumsum()
+total_papers = len(df)
+
+# Find Bradford zones
+zone1_threshold = total_papers / 3
+zone2_threshold = 2 * total_papers / 3
+
+zone1_journals = journal_ranks[journal_ranks['Cumulative'] <= zone1_threshold]
+zone2_journals = journal_ranks[(journal_ranks['Cumulative'] > zone1_threshold) & 
+                              (journal_ranks['Cumulative'] <= zone2_threshold)]
+zone3_journals = journal_ranks[journal_ranks['Cumulative'] > zone2_threshold]
+
+print(f"Zone 1 (Core): {len(zone1_journals)} journals, {zone1_journals['Publications'].sum()} papers")
+print(f"Zone 2: {len(zone2_journals)} journals, {zone2_journals['Publications'].sum()} papers")
+print(f"Zone 3: {len(zone3_journals)} journals, {zone3_journals['Publications'].sum()} papers")
+
+# Plot Bradford's law
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, len(journal_ranks)+1), journal_ranks['Cumulative'])
+plt.axhline(y=zone1_threshold, color='r', linestyle='--', label='Zone 1')
+plt.axhline(y=zone2_threshold, color='g', linestyle='--', label='Zone 2')
+plt.xlabel('Journal Rank')
+plt.ylabel('Cumulative Publications')
+plt.title("Bradford's Law - Journal Distribution")
+plt.legend()
+plt.show()
+
+# 11. h-index and other metrics
+def calculate_h_index(citations):
+    citations_sorted = sorted(citations, reverse=True)
+    h_index = 0
+    for i, citation in enumerate(citations_sorted):
+        if citation >= i + 1:
+            h_index = i + 1
+        else:
+            break
+    return h_index
+
+print("\n=== BIBLIOMETRIC INDICES ===")
+h_index = calculate_h_index(df['TC'].tolist())
+print(f"h-index for the dataset: {h_index}")
+print(f"Total citations: {df['TC'].sum()}")
+print(f"Average citations per paper: {df['TC'].mean():.2f}")
+
+# 12. Generate Summary Report
+report = f"""
+BIBLIOMETRIC ANALYSIS REPORT
+==========================
+
+Dataset Overview:
+----------------
+Total Publications: {len(df)}
+Date Range: {df['PY'].min()} - {df['PY'].max()}
+Total Citations: {df['TC'].sum()}
+Average Citations per Paper: {df['TC'].mean():.2f}
+h-index: {h_index}
+
+Source Distribution:
+------------------
+Web of Science: {len(df[df['SRC'].str.contains('WoS')])}
+Scopus: {len(df[df['SRC'].str.contains('Scopus')])}
+Both Sources: {len(df[df['SRC'].str.contains('Both')])}
+
+Top 5 Most Productive Authors:
+-----------------------------
+{df['First_Author'].value_counts().head(5).to_string()}
+
+Top 5 Most Cited Papers:
+----------------------
+{df.nlargest(5, 'TC')[['TI', 'TC']].to_string()}
+
+Top 5 Journals by Publications:
+------------------------------
+{df['SO'].value_counts().head(5).to_string()}
+
+Top 10 Keywords:
+---------------
+{dict(list(keyword_counts.most_common(10)))}
+
+Network Analysis:
+----------------
+Number of Authors: {G.number_of_nodes()}
+Number of Collaborations: {G.number_of_edges()}
+Network Density: {nx.density(G):.4f}
+
+Bradford's Law Zones:
+-------------------
+Zone 1 (Core): {len(zone1_journals)} journals
+Zone 2: {len(zone2_journals)} journals
+Zone 3: {len(zone3_journals)} journals
+"""
+
+print(report)
+
+# Save report
+with open('bibliometric_analysis_report.txt', 'w') as f:
+    f.write(report)
+files.download('bibliometric_analysis_report.txt')
+
+# 13. Additional Visualizations
+
+# Citation patterns over time
+fig = px.scatter(df, x='PY', y='TC', hover_data=['TI', 'AU'],
+                 title='Citations vs Publication Year',
+                 labels={'PY': 'Publication Year', 'TC': 'Total Citations'})
+fig.update_layout(hovermode='closest')
+fig.show()
+
+# Author collaboration frequency
+collab_freq = df.groupby('First_Author').size().sort_values(ascending=False).head(20)
+fig = px.bar(x=collab_freq.index, y=collab_freq.values,
+             title='Top 20 Authors by Number of Collaborations',
+             labels={'x': 'Author', 'y': 'Number of Publications'})
+fig.update_layout(xaxis_tickangle=-45)
+fig.show()
+
+# Year-wise citation trend
+yearly_citations = df.groupby('PY')['TC'].agg(['count', 'sum', 'mean']).reset_index()
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+fig.add_trace(
+    go.Bar(x=yearly_citations['PY'], y=yearly_citations['count'], name="Publications"),
+    secondary_y=False,
+)
+
+fig.add_trace(
+    go.Scatter(x=yearly_citations['PY'], y=yearly_citations['mean'], 
+               name="Average Citations", mode='lines+markers'),
+    secondary_y=True,
+)
+
+fig.update_layout(title_text="Publications and Average Citations by Year")
+fig.update_xaxes(title_text="Year")
+fig.update_yaxes(title_text="Number of Publications", secondary_y=False)
+fig.update_yaxes(title_text="Average Citations", secondary_y=True)
+fig.show()
+
+print("\nAnalysis complete! All files have been generated and downloaded.")
+print("\nGenerated files:")
+print("1. bibliometric_analysis_report.txt - Comprehensive analysis report")
+print("2. coauthorship_network.html - Interactive co-authorship network")
+print("3. Various visualization plots displayed above")

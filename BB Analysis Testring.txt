@@ -1,0 +1,715 @@
+# --- START OF INSTALLATION BLOCK (RUN THIS CELL FIRST) ---
+
+print("Step 1: Uninstalling potentially conflicting core packages...")
+# Aggressively uninstall common culprits and core data science libraries
+# This tries to remove any existing, incompatible versions.
+!pip uninstall -y numpy scipy pandas gensim bigframes thinc
+
+print("\nStep 2: Installing specific numpy and scipy versions...")
+# Install the specific numpy and scipy versions that are known to work well with gensim/pandas
+!pip install numpy==1.23.5 scipy==1.10.1
+
+print("\nStep 3: Installing pandas (depends on numpy/scipy)...")
+!pip install pandas
+
+print("\nStep 4: Installing gensim (depends on numpy/scipy)...")
+!pip install gensim
+
+print("\nStep 5: Installing other required packages...")
+# Install the rest of the packages
+!pip install matplotlib seaborn plotly networkx wordcloud pyvis scikit-learn
+
+print("\n----------------------------------------------------------------------")
+print("!!!!!!!!!!!!!!!!!!!!!!!! IMPORTANT !!!!!!!!!!!!!!!!!!!!!!!!")
+print("INSTALLATION COMPLETE. PLEASE RESTART THE COLAB RUNTIME NOW.")
+print("Go to 'Runtime' -> 'Restart runtime...' in the Colab menu (or press Ctrl+M .).")
+print("AFTER RESTARTING, RUN ALL CELLS AGAIN FROM THE BEGINNING (including this install cell, but it will skip installed packages).")
+print("The 'numpy.dtype size changed' error should then be resolved.")
+print("----------------------------------------------------------------------")
+
+# This cell will finish execution. The restart is required to load new binaries.
+
+
+
+# Comprehensive Bibliometric Analysis for Google Colab
+# This script analyzes merged bibliometric data and generates various visualizations
+
+# Import all necessary libraries (these should now load correctly after restart)
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import networkx as nx
+from wordcloud import WordCloud
+from collections import Counter
+import re
+from google.colab import files
+import json
+from pyvis.network import Network
+from gensim import corpora, models
+from gensim.utils import simple_preprocess
+# Removed sklearn.feature_extraction.text as it's not directly used in the current version
+import nltk
+from nltk.corpus import stopwords
+import itertools
+
+# Download NLTK stopwords (will prompt user in Colab)
+nltk.download('stopwords')
+stop_words = stopwords.words('english')
+
+# Set display options
+pd.set_option('display.max_colwidth', None)
+plt.style.use('seaborn-v0_8-darkgrid')
+
+# Define term variations
+TERM_VARIATIONS = {
+    'large language model': ['large language model', 'llm', 'large language models', 'llms', 'language model', 'language models'], # Added 'language model'
+    'cybersecurity': ['cybersecurity', 'cyber security'],
+    'forensic': ['forensic', 'forensics'],
+    'generative ai': ['generative ai', 'generative artificial intelligence', 'genai'],
+    # Add more term variations as needed
+}
+
+def standardize_terms(text, variations=TERM_VARIATIONS):
+    """Replaces term variations with a standardized term."""
+    # Ensure text is a string before processing
+    if not isinstance(text, str):
+        return text # Or convert to string if appropriate for your data
+
+    text = text.lower()
+    for standard_term, variations_list in variations.items():
+        # Sort variations by length descending to ensure longer phrases are matched first
+        sorted_variations = sorted(variations_list, key=len, reverse=True)
+        for var in sorted_variations:
+            # Use re.escape for safe regex pattern creation from user-defined terms
+            pattern = r'\b' + re.escape(var) + r'\b'
+            text = re.sub(pattern, standard_term, text)
+    return text
+
+# Define calculate_h_index function here, before its call
+def calculate_h_index(citations):
+    citations_sorted = sorted(citations, reverse=True)
+    h_index = 0
+    for i, citation in enumerate(citations_sorted):
+        if citation >= i + 1:
+            h_index = i + 1
+        else:
+            break
+    return h_index
+
+
+# Upload and read the merged bibliometric data
+print("Please upload your merged bibliometric CSV file")
+uploaded = files.upload()
+filename = next(iter(uploaded.keys()))
+df = pd.read_csv(filename)
+
+print(f"Loaded {len(df)} records")
+print("\nColumns available:", df.columns.tolist())
+
+# 1. Basic Statistics
+print("\n=== BASIC STATISTICS ===")
+print(f"Total publications: {len(df)}")
+print(f"Date range: {df['PY'].min()} to {df['PY'].max()}")
+print(f"Average citations per paper: {df['TC'].mean():.2f}")
+print(f"Total citations: {df['TC'].sum()}")
+
+# 2. Source Distribution
+print("\n=== SOURCE DISTRIBUTION ===")
+source_counts = df['SRC'].value_counts()
+print(source_counts)
+
+# 3. Publication Trends Over Time
+fig = go.Figure()
+
+# Publications by year (line plot)
+year_counts = df['PY'].value_counts().sort_index()
+fig.add_trace(go.Scatter(x=year_counts.index, y=year_counts.values,
+                         mode='lines+markers', name='Publications (Line)',
+                         line=dict(color='rgb(55, 83, 109)', width=3)))
+
+# Add cumulative curve
+cumulative = year_counts.cumsum()
+fig.add_trace(go.Scatter(x=cumulative.index, y=cumulative.values,
+                         mode='lines', name='Cumulative Publications',
+                         line=dict(color='rgb(255, 153, 51)', width=2)))
+
+fig.update_layout(title='Publication Trends Over Time',
+                  xaxis_title='Year',
+                  yaxis_title='Number of Publications',
+                  hovermode='x unified')
+fig.show()
+
+# Publications by year (bar chart)
+fig_bar = px.bar(x=year_counts.index, y=year_counts.values,
+                 title='Annual Publication Counts',
+                 labels={'x': 'Year', 'y': 'Number of Publications'})
+fig_bar.update_layout(xaxis_title='Year', yaxis_title='Number of Publications')
+fig_bar.show()
+
+
+# 4. Most Productive Authors
+print("\n=== MOST PRODUCTIVE AUTHORS ===")
+# Extract first author from author field
+df['First_Author'] = df['AU'].apply(lambda x: x.split(';')[0] if pd.notna(x) else 'Unknown')
+top_authors = df['First_Author'].value_counts().head(20)
+print(top_authors)
+
+# Create author productivity chart
+fig = px.bar(x=top_authors.values, y=top_authors.index, orientation='h',
+             title='Top 20 Most Productive Authors',
+             labels={'x': 'Number of Publications', 'y': 'Author'})
+fig.update_layout(yaxis_title='Author', xaxis_title='Number of Publications')
+fig.show()
+
+# 5. Citation Analysis
+print("\n=== CITATION ANALYSIS ===")
+# Citation distribution
+plt.figure(figsize=(10, 6))
+plt.hist(df['TC'], bins=50, edgecolor='black', alpha=0.7)
+plt.xlabel('Citations')
+plt.ylabel('Frequency')
+plt.title('Citation Distribution')
+plt.yscale('log')
+plt.show()
+
+# Top cited papers
+print("\nTop 10 Most Cited Papers:")
+top_cited = df.nlargest(10, 'TC')[['TI', 'AU', 'PY', 'TC', 'SO']]
+print(top_cited.to_string())
+
+# 6. Journal Analysis
+print("\n=== JOURNAL ANALYSIS ===")
+# Top journals
+top_journals = df['SO'].value_counts().head(15)
+print("\nTop 15 Journals:")
+print(top_journals)
+
+# Journal citation impact
+journal_impact = df.groupby('SO').agg({
+    'TC': ['count', 'sum', 'mean']
+}).sort_values(('TC', 'mean'), ascending=False).head(10)
+journal_impact.columns = ['Publications', 'Total_Citations', 'Avg_Citations']
+print("\nTop 10 Journals by Average Citations:")
+print(journal_impact)
+
+# 7. Keyword Analysis
+def extract_keywords(keyword_str):
+    if pd.isna(keyword_str):
+        return []
+    keywords = [kw.strip() for kw in str(keyword_str).split(';')]
+    # Standardize keywords
+    keywords = [standardize_terms(kw) for kw in keywords if kw.strip()] # Filter out empty strings
+    return keywords
+
+# Combine author and index keywords globally for counting and later for co-occurrence/evolution
+all_keywords = []
+df['processed_keywords'] = df.apply(
+    lambda row: extract_keywords(row['DE']) + extract_keywords(row['ID_KW']), axis=1
+)
+for _, row in df.iterrows():
+    all_keywords.extend(row['processed_keywords'])
+
+
+# Count keywords
+keyword_counts = Counter(all_keywords)
+top_keywords = dict(keyword_counts.most_common(50)) # Still get top 50 for general list and word cloud
+
+print("\n=== KEYWORD ANALYSIS ===")
+print("Top 20 Keywords:")
+for keyword, count in list(top_keywords.items())[:20]:
+    print(f"{keyword}: {count}")
+
+# Create word cloud
+wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(top_keywords)
+plt.figure(figsize=(15, 8))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis('off')
+plt.title('Keyword Cloud')
+plt.show()
+
+# 8. Keyword Evolution Over Time
+print("\n=== KEYWORD EVOLUTION OVER TIME ===")
+
+# Get top 10 keywords overall (from keyword_counts)
+NUM_TOP_KEYWORDS_FOR_EVOLUTION = 10
+top_10_keywords_list = [kw for kw, _ in keyword_counts.most_common(NUM_TOP_KEYWORDS_FOR_EVOLUTION)]
+
+# Create a mapping of (year, keyword) to count
+yearly_keyword_counts = Counter()
+for _, row in df.iterrows():
+    year = row['PY']
+    if pd.notna(year): # Ensure year is not NaN
+        year = int(year)
+        for kw in row['processed_keywords']:
+            if kw in top_10_keywords_list: # Only count for top N keywords
+                yearly_keyword_counts[(year, kw)] += 1
+
+# Convert to DataFrame
+yearly_keyword_df = pd.DataFrame([
+    {'Year': year, 'Keyword': keyword, 'Count': count}
+    for (year, keyword), count in yearly_keyword_counts.items()
+])
+
+# Ensure all years are present for all top keywords (fill missing with 0 for consistent lines)
+all_years = sorted(df['PY'].dropna().unique())
+if yearly_keyword_df.empty or not all_years: # Handle case with no data or no years
+    print(f"Warning: No yearly data found for top {NUM_TOP_KEYWORDS_FOR_EVOLUTION} keywords or no valid years. Skipping keyword evolution plot.")
+else:
+    # Create a full grid of (year, keyword) for all top keywords
+    full_idx = pd.MultiIndex.from_product([all_years, top_10_keywords_list], names=['Year', 'Keyword'])
+    top_10_yearly_keyword_df = yearly_keyword_df.set_index(['Year', 'Keyword']).reindex(full_idx, fill_value=0).reset_index()
+
+    # Plotting using Plotly Express
+    fig = px.line(top_10_yearly_keyword_df, x='Year', y='Count', color='Keyword',
+                  title=f'Evolution of Top {NUM_TOP_KEYWORDS_FOR_EVOLUTION} Keywords Over Time',
+                  labels={'Count': 'Number of Occurrences', 'Year': 'Publication Year'})
+    fig.update_layout(hovermode='x unified')
+    fig.show()
+
+# 9. Co-authorship Network Analysis
+def extract_authors(author_str):
+    if pd.isna(author_str):
+        return []
+    return [a.strip() for a in str(author_str).split(';')]
+
+# Build co-authorship network
+G_authors = nx.Graph()
+for _, row in df.iterrows():
+    authors = extract_authors(row['AU'])
+    # Standardize authors *before* adding to graph
+    standardized_authors = [standardize_terms(author) for author in authors if author.strip()] # Filter empty
+    standardized_authors = list(set(standardized_authors)) # Remove duplicates within a paper
+
+    for i, author1 in enumerate(standardized_authors):
+        for author2 in standardized_authors[i+1:]:
+            if G_authors.has_edge(author1, author2):
+                G_authors[author1][author2]['weight'] += 1
+            else:
+                G_authors.add_edge(author1, author2, weight=1)
+
+# Analyze network
+print("\n=== CO-AUTHORSHIP NETWORK ===")
+print(f"Number of authors: {G_authors.number_of_nodes()}")
+print(f"Number of collaborations: {G_authors.number_of_edges()}")
+if G_authors.number_of_nodes() > 1: # Check to avoid division by zero for density
+    print(f"Density: {nx.density(G_authors):.4f}")
+else:
+    print("Density: N/A (not enough authors for density calculation)")
+
+# Find most connected authors
+degree_centrality = nx.degree_centrality(G_authors)
+top_connected = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)[:10]
+print("\nTop 10 Most Connected Authors:")
+for author, centrality in top_connected:
+    print(f"{author}: {centrality:.4f}")
+
+# Visualize co-authorship network (small subset)
+# Extract largest connected component
+if G_authors.number_of_nodes() > 0: # Check if graph is not empty
+    largest_cc = max(nx.connected_components(G_authors), key=len)
+    G_authors_sub = G_authors.subgraph(largest_cc)
+
+    # Further reduce for visualization
+    if len(G_authors_sub) > 100:
+        # Keep only highly connected nodes
+        degrees = dict(G_authors_sub.degree())
+        high_degree_nodes = [node for node, degree in degrees.items() if degree >= 3]
+        G_authors_sub = G_authors_sub.subgraph(high_degree_nodes)
+
+    # Create interactive visualization
+    if len(G_authors_sub) > 0: # Ensure subgraph is not empty before visualizing
+        net = Network(height='600px', width='100%', bgcolor='#222222', font_color='white')
+        net.from_nx(G_authors_sub)
+        net.save_graph("coauthorship_network.html")
+        files.download("coauthorship_network.html")
+    else:
+        print("Co-authorship network too small or disconnected for meaningful visualization.")
+else:
+    print("No authors found for co-authorship network analysis.")
+
+
+# 10. Keyword Co-occurrence Network Analysis
+print("\n=== KEYWORD CO-OCCURRENCE NETWORK ===")
+
+G_keywords = nx.Graph() # Graph for keyword co-occurrence
+
+for _, row in df.iterrows():
+    keywords_in_doc = list(set(row['processed_keywords'])) # Ensure unique keywords per doc
+    for kw1, kw2 in itertools.combinations(keywords_in_doc, 2):
+        if kw1 and kw2: # Ensure keywords are not empty strings
+            if G_keywords.has_edge(kw1, kw2):
+                G_keywords[kw1][kw2]['weight'] += 1
+            else:
+                G_keywords.add_edge(kw1, kw2, weight=1)
+
+print(f"Number of unique keywords: {G_keywords.number_of_nodes()}")
+print(f"Number of co-occurrences: {G_keywords.number_of_edges()}")
+if G_keywords.number_of_nodes() > 1:
+    print(f"Density: {nx.density(G_keywords):.4f}")
+else:
+    print("Density: N/A (not enough keywords)")
+
+# Visualize keyword co-occurrence network - FOCUS ON TOP 10 KEYWORDS and STABLE DISPLAY
+if G_keywords.number_of_nodes() > 0:
+    NUM_TOP_KEYWORDS_FOR_COOCCURRENCE = 10 # Changed to 10 as requested
+
+    # Get the names of the top N most frequent keywords
+    top_n_keywords_list_cooccurrence = [keyword for keyword, count in keyword_counts.most_common(NUM_TOP_KEYWORDS_FOR_COOCCURRENCE)]
+
+    # Create a subgraph containing only these top N keywords
+    G_keywords_filtered = G_keywords.subgraph(top_n_keywords_list_cooccurrence).copy()
+
+    # Further filter edges by a minimum co-occurrence weight
+    min_cooccurrence_weight_for_display = 2 # Adjust this threshold as needed for clarity
+    edges_to_keep = [(u, v) for u, v, data in G_keywords_filtered.edges(data=True) if data['weight'] >= min_cooccurrence_weight_for_display]
+    G_keywords_filtered = G_keywords_filtered.edge_subgraph(edges_to_keep).copy()
+
+    # Remove isolated nodes after edge filtering (if any of the top N become isolated)
+    G_keywords_filtered.remove_nodes_from(list(nx.isolates(G_keywords_filtered)))
+
+    if len(G_keywords_filtered) > 0:
+        # Initialize Network object without physics/stabilization options directly in constructor
+        net = Network(height='750px', width='100%', bgcolor='#222222', font_color='white',
+                      notebook=True, directed=False)
+
+        # Set physics and stabilization options using set_options method
+        # This will prevent nodes from moving after initial layout
+        net.set_options("""
+        var options = {
+            "physics": {
+                "enabled": false
+            },
+            "stabilization": {
+                "enabled": false
+            }
+        }
+        """)
+
+        # Add nodes with size based on frequency
+        for node in G_keywords_filtered.nodes():
+            size = np.log(keyword_counts.get(node, 1) + 1) * 5 + 5 # Log scale for size, with min size
+            net.add_node(node, label=node, size=size, title=f"Frequency: {keyword_counts.get(node, 0)}")
+
+        # Add edges with width based on co-occurrence weight
+        for u, v, data in G_keywords_filtered.edges(data=True):
+            width = data['weight']
+            net.add_edge(u, v, value=width, title=f"Co-occurrence: {width}")
+
+        net.save_graph("keyword_cooccurrence_network.html")
+        files.download("keyword_cooccurrence_network.html")
+    else:
+        print(f"Keyword co-occurrence network for top {NUM_TOP_KEYWORDS_FOR_COOCCURRENCE} keywords is too sparse for meaningful visualization after co-occurrence filtering.")
+else:
+    print("No keywords found for co-occurrence network analysis.")
+
+
+# 11. Citation Network (previously 10)
+# Simplified citation network based on common keywords
+print("\n=== CITATION NETWORK ANALYSIS (KEYWORD SIMILARITY) ===")
+# Create paper similarity network based on shared keywords
+papers = df[['TI', 'DE', 'ID_KW']].copy()
+papers['keywords'] = papers.apply(lambda x: extract_keywords(x['DE']) + extract_keywords(x['ID_KW']), axis=1)
+# Standardize title for nodes
+papers['TI_standardized'] = papers['TI'].fillna('').apply(standardize_terms)
+
+citation_net = nx.Graph()
+similarity_threshold = 3  # minimum shared keywords
+
+# Using a list of tuples to avoid modifying df during iteration and for clearer iteration
+papers_list = papers.to_dict('records')
+
+for i in range(len(papers_list)):
+    paper1 = papers_list[i]
+    for j in range(i + 1, len(papers_list)):
+        paper2 = papers_list[j]
+        shared_keywords = len(set(paper1['keywords']) & set(paper2['keywords']))
+        if shared_keywords >= similarity_threshold:
+            # Truncate titles to avoid excessively long node names in networkx
+            # Add a unique identifier if title is empty or identical after truncation
+            title1_base = paper1['TI_standardized'][:100] if paper1['TI_standardized'] else f"Paper_{i}"
+            title2_base = paper2['TI_standardized'][:100] if paper2['TI_standardized'] else f"Paper_{j}"
+
+            # Ensure unique node names
+            # This logic can be tricky if titles are truly identical and many, consider adding a paper ID if available
+            title1 = title1_base if title1_base not in citation_net else f"{title1_base}_{i}"
+            title2 = title2_base if (title2_base not in citation_net) or (title1 == title2_base and title1 != title2_base) else f"{title2_base}_{j}" # Improved uniqueness check
+
+            citation_net.add_edge(title1, title2, weight=shared_keywords)
+
+print(f"Number of papers in citation network: {citation_net.number_of_nodes()}")
+print(f"Number of connections: {citation_net.number_of_edges()}")
+
+# 12. Bradford's Law Analysis (previously 11)
+print("\n=== BRADFORD'S LAW ANALYSIS ===")
+# Rank journals by publications
+journal_ranks = df['SO'].value_counts().reset_index()
+journal_ranks.columns = ['Journal', 'Publications']
+journal_ranks['Cumulative'] = journal_ranks['Publications'].cumsum()
+total_papers = len(df)
+
+# Find Bradford zones
+zone1_threshold = total_papers / 3
+zone2_threshold = 2 * total_papers / 3
+
+zone1_journals = journal_ranks[journal_ranks['Cumulative'] <= zone1_threshold]
+zone2_journals = journal_ranks[(journal_ranks['Cumulative'] > zone1_threshold) &
+                              (journal_ranks['Cumulative'] <= zone2_threshold)]
+zone3_journals = journal_ranks[journal_ranks['Cumulative'] > zone2_threshold]
+
+print(f"Zone 1 (Core): {len(zone1_journals)} journals, {zone1_journals['Publications'].sum()} papers")
+print(f"Zone 2: {len(zone2_journals)} journals, {zone2_journals['Publications'].sum()} papers")
+print(f"Zone 3: {len(zone3_journals)} journals, {zone3_journals['Publications'].sum()} papers")
+
+# Plot Bradford's law
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, len(journal_ranks)+1), journal_ranks['Cumulative'])
+plt.axhline(y=zone1_threshold, color='r', linestyle='--', label='Zone 1')
+plt.axhline(y=zone2_threshold, color='g', linestyle='--', label='Zone 2')
+plt.xlabel('Journal Rank')
+plt.ylabel('Cumulative Publications')
+plt.title("Bradford's Law - Journal Distribution")
+plt.legend()
+plt.show()
+
+# 13. h-index and other metrics (previously 12)
+print("\n=== BIBLIOMETRIC INDICES ===")
+h_index = calculate_h_index(df['TC'].fillna(0).tolist()) # Handle potential NaN in TC
+print(f"h-index for the dataset: {h_index}")
+print(f"Total citations: {df['TC'].sum()}")
+print(f"Average citations per paper: {df['TC'].mean():.2f}")
+
+# 14. Topic Modeling (LDA) (previously 13)
+print("\n=== TOPIC MODELING ===")
+
+# Prepare text data - using titles and abstracts
+df['AB'] = df['AB'].fillna('')  # Replace NaN abstract values with empty strings
+df['TI'] = df['TI'].fillna('')  # Replace NaN title values with empty strings
+documents_raw = df['TI'] + ' ' + df['AB']
+documents = documents_raw.apply(standardize_terms)
+
+# Tokenize and preprocess documents
+def preprocess(text):
+    result = []
+    for token in simple_preprocess(text, deacc=True):  # Remove accents
+        # Ensure token is string and check if it's alphanumeric to filter out stray punctuation
+        if token.isalpha() and token not in stop_words and len(token) > 3:  # Remove stop words and short tokens
+            result.append(token)
+    return result
+
+processed_docs = documents.map(preprocess)
+
+# Create dictionary and corpus
+# Filter out words that appear in less than no_below documents or more than no_above*num_docs documents
+# and keep only the top num_features most frequent tokens.
+dictionary = corpora.Dictionary(processed_docs)
+dictionary.filter_extremes(no_below=5, no_above=0.5, keep_n=100000) # Adjust these values as needed
+corpus = [dictionary.doc2bow(doc) for doc in processed_docs]
+
+# Ensure corpus is not empty before training LDA
+if not corpus:
+    print("Warning: Corpus is empty after preprocessing. Cannot perform topic modeling.")
+    num_topics = 0 # Set num_topics to 0 if corpus is empty to avoid errors later
+    normalized_topics = []
+else:
+    # Train LDA model
+    num_topics = 5  # You can adjust the number of topics
+    # Increase passes for better convergence
+    lda_model = models.LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=20, random_state=100)
+
+    # Get topic distributions
+    topic_distributions = [lda_model[doc] for doc in corpus]
+
+    # Print topics and their keywords
+    print("Topics and Keywords (Raw):")
+    for idx, topic in lda_model.print_topics(-1):
+        print(f"Topic: {idx + 1} \nWords: {topic}\n") # +1 for display
+
+    # Calculate term frequency across entire corpus
+    term_frequencies = {}
+    for doc in corpus:
+        for term_id, count in doc:
+            term = dictionary[term_id]
+            if term not in term_frequencies:
+                term_frequencies[term] = 0
+            term_frequencies[term] += count
+
+    total_terms = sum(term_frequencies.values())
+
+    # Normalize term frequencies by global frequency
+    def normalize_topic_terms(topic, term_frequencies, total_terms):
+        normalized_topic = []
+        for term, weight in topic:
+            global_freq = term_frequencies.get(term, 0) / total_terms if total_terms > 0 else 0
+            # Adding a small value to avoid division by zero and to prevent very common words from dominating if their raw weight is high
+            normalized_weight = weight / (global_freq + 1e-6) if global_freq > 0 else weight * 1000 # If global_freq is zero, it's a rare word, give it a higher weight
+            normalized_topic.append((term, normalized_weight))
+        # Sort by normalized weight descending
+        return sorted(normalized_topic, key=lambda x: x[1], reverse=True)
+
+    # Normalize topic terms
+    normalized_topics = []
+    for topic_id in range(num_topics):
+        # Get top 20 terms for normalization
+        topic_terms = lda_model.show_topic(topic_id, topn=20)
+        normalized_topic_terms = normalize_topic_terms(topic_terms, term_frequencies, total_terms)
+        normalized_topics.append((topic_id, normalized_topic_terms))
+
+    # Print normalized topics
+    print("\nNormalized Topics and Keywords:")
+    for topic_id, topic_terms in normalized_topics:
+        print(f"Topic: {topic_id + 1}") # +1 for display
+        for term, weight in topic_terms[:10]: # Print top 10 normalized terms
+            print(f"  {term}: {weight:.4f}")
+        print()
+
+    # Assign dominant topic to each document
+    def get_dominant_topic(topic_distribution):
+        if not topic_distribution: # Handle cases where a doc might not have any topics
+            return -1 # Or a specific indicator for no dominant topic
+        topic_id, prob = max(topic_distribution, key=lambda item: item[1])
+        return int(topic_id)  # Ensure topic_id is an integer (0-indexed internally)
+
+    df['dominant_topic'] = [get_dominant_topic(dist) for dist in topic_distributions]
+
+    # Analyze topic distribution
+    topic_counts = df['dominant_topic'].value_counts().sort_index()
+    print("\nTopic Distribution:")
+    print(topic_counts)
+
+    # Visualize topic distribution
+    plt.figure(figsize=(10, 6))
+    topic_counts.plot(kind='bar')
+    plt.xlabel('Topic')
+    plt.ylabel('Number of Documents')
+    plt.title('Distribution of Topics')
+    plt.xticks(ticks=range(len(topic_counts)), labels=[f'Topic {i+1}' for i in topic_counts.index], rotation=0) # +1 for display
+    plt.show()
+
+
+# 15. Generate Summary Report (previously 14)
+
+# Calculate network densities for display before forming the f-string
+author_network_density_display = f"{nx.density(G_authors):.4f}" if G_authors.number_of_nodes() > 1 else 'N/A'
+keyword_network_density_display = f"{nx.density(G_keywords):.4f}" if G_keywords.number_of_nodes() > 1 else 'N/A'
+
+report = f"""
+BIBLIOMETRIC ANALYSIS REPORT
+==========================
+
+Dataset Overview:
+----------------
+Total Publications: {len(df)}
+Date Range: {df['PY'].min()} - {df['PY'].max()}
+Total Citations: {df['TC'].sum()}
+Average Citations per Paper: {df['TC'].mean():.2f}
+h-index: {h_index}
+
+Source Distribution:
+------------------
+Web of Science: {len(df[df['SRC'].astype(str).str.contains('WoS')])}
+Scopus: {len(df[df['SRC'].astype(str).str.contains('Scopus')])}
+Both Sources: {len(df[df['SRC'].astype(str).str.contains('Both')])}
+
+Top 5 Most Productive Authors:
+-----------------------------
+{df['First_Author'].value_counts().head(5).to_string()}
+
+Top 5 Most Cited Papers:
+----------------------
+{df.nlargest(5, 'TC')[['TI', 'TC']].to_string()}
+
+Top 5 Journals by Publications:
+------------------------------
+{df['SO'].value_counts().head(5).to_string()}
+
+Top 10 Keywords:
+---------------
+{dict(list(keyword_counts.most_common(10)))}
+
+Network Analysis:
+----------------
+Number of Authors: {G_authors.number_of_nodes()}
+Number of Collaborations: {G_authors.number_of_edges()}
+Network Density: {author_network_density_display}
+
+Keyword Co-occurrence Network:
+-----------------------------
+Number of Unique Keywords: {G_keywords.number_of_nodes()}
+Number of Co-occurrences: {G_keywords.number_of_edges()}
+Network Density: {keyword_network_density_display}
+
+Bradford's Law Zones:
+-------------------
+Zone 1 (Core): {len(zone1_journals)} journals
+Zone 2: {len(zone2_journals)} journals
+Zone 3: {len(zone3_journals)} journals
+
+Topic Modeling Results:
+-----------------------
+Number of Topics: {num_topics}
+"""
+
+# Append normalized topic summaries to the report string
+if num_topics > 0:
+    for topic_id, topic_terms in normalized_topics:
+        # Get only the term for printing in the summary
+        topic_summary_terms = [term for term, weight in topic_terms[:10]] # Print top 10 terms for summary
+        report += f"Topic {topic_id + 1}: {', '.join(topic_summary_terms)}\n" # +1 for display
+else:
+    report += "Topic modeling could not be performed due to empty corpus.\n"
+
+print(report)
+
+# Save report
+with open('bibliometric_analysis_report.txt', 'w') as f:
+    f.write(report)
+files.download('bibliometric_analysis_report.txt')
+
+# 16. Additional Visualizations (previously 15)
+
+# Citation patterns over time
+fig = px.scatter(df, x='PY', y='TC', hover_data=['TI', 'AU'],
+                 title='Citations vs Publication Year',
+                 labels={'PY': 'Publication Year', 'TC': 'Total Citations'})
+fig.update_layout(hovermode='closest')
+fig.show()
+
+# Author collaboration frequency
+collab_freq = df.groupby('First_Author').size().sort_values(ascending=False).head(20)
+fig = px.bar(x=collab_freq.index, y=collab_freq.values,
+             title='Top 20 Authors by Number of Collaborations',
+             labels={'x': 'Author', 'y': 'Number of Publications'})
+fig.update_layout(xaxis_tickangle=-45)
+fig.show()
+
+# Year-wise citation trend
+yearly_citations = df.groupby('PY')['TC'].agg(['count', 'sum', 'mean']).reset_index()
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+fig.add_trace(
+    go.Bar(x=yearly_citations['PY'], y=yearly_citations['count'], name="Publications"),
+    secondary_y=False,
+)
+
+fig.add_trace(
+    go.Scatter(x=yearly_citations['PY'], y=yearly_citations['mean'],
+               name="Average Citations", mode='lines+markers'),
+    secondary_y=True,
+)
+
+fig.update_layout(title_text="Publications and Average Citations by Year")
+fig.update_xaxes(title_text="Year")
+fig.update_yaxes(title_text="Number of Publications", secondary_y=False)
+fig.update_yaxes(title_text="Average Citations", secondary_y=True)
+fig.show()
+
+print("\nAnalysis complete! All files have been generated and downloaded.")
+print("\nGenerated files:")
+print("1. bibliometric_analysis_report.txt - Comprehensive analysis report")
+print("2. coauthorship_network.html - Interactive co-authorship network")
+print("3. keyword_cooccurrence_network.html - Interactive keyword co-occurrence network (NEW)")
+print("4. Various visualization plots displayed above")

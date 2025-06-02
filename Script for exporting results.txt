@@ -1,0 +1,192 @@
+# === SECTION: EXPORT RESULTS TO WORD DOCUMENT ===
+# Run this cell AFTER your main analysis script has completed successfully.
+
+print("--- Exporting Results to Word Document ---")
+
+# 1. Install necessary libraries
+print("Installing required libraries for export...")
+!pip install python-docx selenium webdriver-manager --quiet
+print("Libraries installed.")
+
+import os
+import time
+from docx import Document
+from docx.shared import Inches, Pt
+from pathlib import Path
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from google.colab import files # For downloading the final doc
+
+# 2. Define Directories and Output File Name
+output_dir = '/content/results' # <--- Should match the output_dir in your main script
+word_doc_filename = 'colab_output_summary.docx'
+word_doc_path = os.path.join(output_dir, word_doc_filename)
+temp_screenshot_dir = '/content/temp_screenshots' # For temporary HTML screenshots
+
+# Create temp dir for screenshots
+os.makedirs(temp_screenshot_dir, exist_ok=True)
+
+# 3. Setup Selenium Headless Browser (for HTML screenshots)
+print("Setting up headless browser for HTML screenshots...")
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--no-sandbox") # Recommended for Colab
+chrome_options.add_argument("--disable-dev-shm-usage") # Recommended for Colab
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--window-size=1200,800") # Adjust if needed for graph layout
+
+# Use webdriver-manager to handle chromedriver automatically
+try:
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    print("Headless browser setup successful.")
+    selenium_ok = True
+except Exception as e:
+    print(f"❌ Error setting up Selenium/ChromeDriver: {e}")
+    print("   HTML visualizations will not be screenshotted.")
+    selenium_ok = False
+    driver = None
+
+# 4. Create Word Document
+doc = Document()
+doc.add_heading('Colab Analysis Output Summary', level=0)
+doc.add_paragraph(f"This document summarizes the outputs generated in the directory: {output_dir}")
+doc.add_paragraph(f"Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+doc.add_paragraph("Note: Interactive HTML visualizations are included as static screenshots.")
+doc.add_paragraph("Console output (print statements) from the analysis script is not automatically included.")
+doc.add_paragraph("-" * 30)
+
+# 5. Process Files in Output Directory
+print(f"\nProcessing files in {output_dir}...")
+files_processed_count = 0
+
+# Sort files for potentially better order (e.g., summaries first)
+try:
+    all_files = sorted(os.listdir(output_dir))
+except FileNotFoundError:
+    print(f"❌ Error: Output directory '{output_dir}' not found. Did the main script run correctly?")
+    all_files = []
+    doc.add_paragraph(f"ERROR: Output directory '{output_dir}' not found.")
+
+for filename in all_files:
+    if filename == word_doc_filename: # Skip the document itself
+        continue
+
+    file_path = os.path.join(output_dir, filename)
+    if not os.path.isfile(file_path): # Skip directories
+        continue
+
+    print(f"  Processing: {filename}")
+    files_processed_count += 1
+
+    try:
+        # --- Handle PNG images ---
+        if filename.lower().endswith('.png'):
+            doc.add_heading(f"Image: {filename}", level=2)
+            try:
+                # Add picture, adjust width as needed
+                doc.add_picture(file_path, width=Inches(6.0))
+                doc.add_paragraph(f"(File: {filename})", style='Caption') # Add caption
+            except Exception as img_e:
+                print(f"    ⚠️ Error adding image {filename}: {img_e}")
+                doc.add_paragraph(f"[Error adding image: {filename}]")
+            doc.add_paragraph() # Add space
+
+        # --- Handle HTML visualizations (Screenshot with Selenium) ---
+        elif filename.lower().endswith('.html') or filename.lower().endswith('.htm'):
+            doc.add_heading(f"HTML Visualization (Screenshot): {filename}", level=2)
+            if selenium_ok and driver:
+                screenshot_path = os.path.join(temp_screenshot_dir, f"{Path(filename).stem}.png")
+                try:
+                    # Need file:// URI for local files in Selenium
+                    file_uri = f"file://{os.path.abspath(file_path)}"
+                    driver.get(file_uri)
+                    # Wait for JavaScript (PyVis) to render - adjust sleep time if needed
+                    time.sleep(4) # Increased wait time for potentially complex graphs
+                    driver.save_screenshot(screenshot_path)
+                    print(f"    Screenshot saved to {screenshot_path}")
+                    if os.path.exists(screenshot_path):
+                         doc.add_picture(screenshot_path, width=Inches(6.0))
+                         doc.add_paragraph(f"(Screenshot of: {filename})", style='Caption')
+                         # Clean up the temporary screenshot
+                         try:
+                             os.remove(screenshot_path)
+                         except Exception:
+                             print(f"    ⚠️ Could not remove temp screenshot: {screenshot_path}")
+                    else:
+                        print(f"    ⚠️ Screenshot file not found after saving: {screenshot_path}")
+                        doc.add_paragraph(f"[Screenshot failed for {filename}]")
+
+                except Exception as html_e:
+                    print(f"    ❌ Error processing HTML {filename} with Selenium: {html_e}")
+                    doc.add_paragraph(f"[Error taking screenshot of {filename}: {html_e}]")
+            else:
+                doc.add_paragraph(f"[Could not take screenshot - Selenium not available. Original file: {filename}]")
+            doc.add_paragraph(f"The original interactive file is available: {filename}")
+            doc.add_paragraph()
+
+        # --- Handle CSV/Text/JSON files (List name, maybe first few lines) ---
+        elif filename.lower().endswith(('.csv', '.txt', '.json')):
+            doc.add_heading(f"Data File: {filename}", level=2)
+            doc.add_paragraph(f"File '{filename}' contains tabular data, text, or JSON.")
+            # Optional: Add first few lines for context (be careful with large files)
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = [next(f) for _ in range(5)] # Read up to 5 lines
+                if lines:
+                    doc.add_paragraph("First few lines:")
+                    p = doc.add_paragraph()
+                    p.add_run("\n".join([line.strip() for line in lines])).font.size = Pt(8)
+            except Exception as read_e:
+                print(f"    ⚠️ Could not read preview of {filename}: {read_e}")
+            doc.add_paragraph()
+
+        # --- Handle Model/Graph files (Just list name) ---
+        elif filename.lower().endswith(('.pkl', '.graphml')):
+             doc.add_heading(f"Model/Graph File: {filename}", level=2)
+             doc.add_paragraph(f"File '{filename}' contains a saved model or graph data.")
+             doc.add_paragraph()
+
+        # --- Handle other file types ---
+        else:
+            doc.add_heading(f"Other File: {filename}", level=2)
+            doc.add_paragraph(f"File '{filename}' was found in the output directory.")
+            doc.add_paragraph()
+
+    except Exception as file_proc_e:
+        print(f"    ❌ Unexpected error processing file {filename}: {file_proc_e}")
+        doc.add_paragraph(f"[Unexpected error processing file: {filename}]")
+        doc.add_paragraph()
+
+# 6. Clean up Selenium
+if driver:
+    print("Closing headless browser...")
+    driver.quit()
+# Clean up temp screenshot dir
+try:
+    if os.path.exists(temp_screenshot_dir):
+        import shutil
+        shutil.rmtree(temp_screenshot_dir)
+        print("Removed temporary screenshot directory.")
+except Exception as clean_e:
+    print(f"⚠️ Error removing temp directory {temp_screenshot_dir}: {clean_e}")
+
+
+# 7. Save the Word Document
+print(f"\nSaving Word document to: {word_doc_path}")
+try:
+    doc.save(word_doc_path)
+    print(f"✅ Word document saved successfully.")
+
+    # 8. Offer Download in Colab
+    print(f"\nAttempting to offer '{word_doc_filename}' for download...")
+    files.download(word_doc_path)
+    print("   If download doesn't start automatically, check your browser pop-up settings.")
+    print("   The file is also available in the 'results' folder in the Colab file browser (left panel).")
+
+except Exception as save_e:
+    print(f"❌ Error saving Word document: {save_e}")
+
+print("\n--- Export Finished ---")

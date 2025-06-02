@@ -1,0 +1,219 @@
+# === SECTION: EGO NETWORKS & HIGH-RES STATIC RENDERS ===
+# Run this cell AFTER your main analysis script has completed successfully.
+
+print("--- Generating Ego Networks & High-Res Renders ---")
+
+import os
+import time
+import networkx as nx
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+from google.colab import files # For potential download trigger if needed
+
+# --- Dependencies for High-Res Renders ---
+print("\nInstalling required libraries & Google Chrome for high-res renders...")
+# Update package list and install Chrome
+!apt-get update > /dev/null 2>&1
+!apt-get install -y google-chrome-stable > /dev/null 2>&1
+# Install Python libraries
+!pip install selenium webdriver-manager --quiet
+print("Libraries and Chrome installed.")
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
+# --- Configuration ---
+output_dir = '/content/results' # MUST match the output_dir in your main script
+ego_network_radius = 1         # How many steps away from the center node (1 = immediate neighbors)
+high_res_window_size = "2400,1600" # Width,Height for screenshots (adjust as needed)
+key_concepts = [
+    # --- !!! EDIT THIS LIST !!! ---
+    # Add the exact node IDs (lowercase entity text) you want ego networks for.
+    # Example:
+    # "machine learning",
+    # "data analysis",
+    # "covid-19",
+    # "university of california",
+    # "graph neural network",
+    # "topic modeling"
+]
+print(f"\nKey concepts for Ego Networks: {key_concepts}")
+if not key_concepts:
+    print("⚠️ Key concepts list is empty. Ego networks will not be generated.")
+
+# Check if the main graph exists (it should be in memory from the previous script)
+if 'knowledge_graph_nx' not in locals() or not isinstance(knowledge_graph_nx, nx.Graph):
+    # Attempt to load the graph if not in memory (optional, depends on your workflow)
+    graphml_path = os.path.join(output_dir, "knowledge_graph_nx_topics.graphml") # Try topic-aware first
+    if not os.path.exists(graphml_path):
+        graphml_path = os.path.join(output_dir, "knowledge_graph_nx.graphml") # Fallback to base
+
+    if os.path.exists(graphml_path):
+        print(f"Knowledge graph not in memory, attempting to load from: {graphml_path}")
+        try:
+            knowledge_graph_nx = nx.read_graphml(graphml_path)
+            # Convert node attributes back if needed (GraphML might stringify)
+            for node, data in knowledge_graph_nx.nodes(data=True):
+                 if 'topic' in data and isinstance(data['topic'], str) and data['topic'].isdigit():
+                      data['topic'] = int(data['topic'])
+                 # Add other type conversions if necessary
+            print(f"Successfully loaded graph with {knowledge_graph_nx.number_of_nodes()} nodes.")
+        except Exception as e:
+            print(f"❌ Error loading graph from {graphml_path}: {e}")
+            knowledge_graph_nx = None # Ensure it's None if loading failed
+    else:
+        print("❌ Main knowledge graph ('knowledge_graph_nx') not found in memory or as .graphml file.")
+        print("   Cannot generate ego networks. Run the main script first.")
+        knowledge_graph_nx = None # Ensure it's None
+
+# --- 1. Generate Ego Networks ---
+if knowledge_graph_nx and key_concepts:
+    print("\n--- Generating Ego Networks ---")
+    # Ensure the helper function 'show_interactive_kg' is available
+    if 'show_interactive_kg' not in locals():
+        print("❌ ERROR: The 'show_interactive_kg' function is not defined.")
+        print("   Make sure the cell defining helper functions from the main script was run.")
+    else:
+        ego_count = 0
+        for concept_node_id in key_concepts:
+            concept_node_id = concept_node_id.lower().strip() # Ensure lowercase/strip whitespace
+            print(f"\nProcessing ego network for: '{concept_node_id}'")
+
+            if concept_node_id not in knowledge_graph_nx:
+                print(f"  ⚠️ Node '{concept_node_id}' not found in the main graph. Skipping.")
+                continue
+
+            try:
+                # Generate the ego graph
+                ego_g = nx.ego_graph(knowledge_graph_nx, concept_node_id, radius=ego_network_radius)
+                print(f"  Ego graph created: {ego_g.number_of_nodes()} nodes, {ego_g.number_of_edges()} edges.")
+
+                if ego_g.number_of_nodes() <= 1 and ego_g.number_of_edges() == 0:
+                    print(f"  Node '{concept_node_id}' has no connections within radius {ego_network_radius}. Skipping visualization.")
+                    continue
+
+                # --- Static Plot (Matplotlib) ---
+                static_plot_filename = f"ego_{concept_node_id.replace(' ','_')}.png"
+                static_plot_path = os.path.join(output_dir, static_plot_filename)
+                plt.figure(figsize=(10, 8))
+                pos = nx.spring_layout(ego_g, k=0.5, iterations=50) # Simple layout
+                # Use labels from the graph data
+                labels = {n: data.get('label', n)[:20] for n, data in ego_g.nodes(data=True)} # Truncate labels
+                # Draw nodes, color center node differently
+                node_colors = ['red' if n == concept_node_id else 'skyblue' for n in ego_g.nodes()]
+                nx.draw(ego_g, pos,
+                        with_labels=False, # Draw labels separately
+                        node_color=node_colors,
+                        node_size=300,
+                        font_size=8,
+                        edge_color='#cccccc',
+                        alpha=0.8)
+                nx.draw_networkx_labels(ego_g, pos, labels=labels, font_size=8)
+                plt.title(f"Ego Network: {labels.get(concept_node_id, concept_node_id)} (Radius {ego_network_radius})")
+                plt.savefig(static_plot_path, dpi=150, bbox_inches='tight')
+                plt.close() # Close plot to free memory
+                print(f"  Saved static ego plot: {static_plot_filename}")
+
+                # --- Interactive Plot (PyVis using existing function) ---
+                interactive_plot_filename = f"ego_{concept_node_id.replace(' ','_')}_interactive.html"
+                title = f"Interactive Ego Network: {labels.get(concept_node_id, concept_node_id)}"
+                # Call the existing function, don't filter ego nets heavily by default
+                show_interactive_kg(ego_g,
+                                    output_filename=interactive_plot_filename,
+                                    output_dir=output_dir,
+                                    color_attribute='type', # Color by type, or 'topic'/'community' if available
+                                    filter_min_degree=0,    # Show all nodes in the ego net
+                                    max_nodes_to_display=None, # Show all nodes
+                                    title=title)
+                # Note: show_interactive_kg prints its own success message
+
+                ego_count += 1
+
+            except Exception as e:
+                print(f"  ❌ Error generating ego network for '{concept_node_id}': {e}")
+
+        print(f"\nGenerated {ego_count} ego network visualizations.")
+
+# --- 2. Generate High-Resolution Static Renders ---
+print("\n--- Generating High-Resolution Static Renders of Main Graphs ---")
+
+# Setup Selenium
+print("Setting up headless browser for high-res screenshots...")
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument(f"--window-size={high_res_window_size}")
+
+try:
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    print(f"Headless browser ready (Window Size: {high_res_window_size}).")
+    selenium_ok = True
+except Exception as e:
+    print(f"❌ Error setting up Selenium/ChromeDriver: {e}")
+    print("   High-resolution renders cannot be generated.")
+    selenium_ok = False
+    driver = None
+
+if selenium_ok and driver:
+    html_files_to_render = []
+    try:
+        for filename in os.listdir(output_dir):
+            # Target the main interactive graphs generated by the previous script
+            if filename.lower().startswith("knowledge_graph_interactive_") and filename.lower().endswith(".html"):
+                 html_files_to_render.append(filename)
+    except FileNotFoundError:
+        print(f"❌ Output directory '{output_dir}' not found.")
+
+    if not html_files_to_render:
+        print("No interactive HTML graph files found in the output directory to render.")
+    else:
+        print(f"Found {len(html_files_to_render)} HTML files to render: {html_files_to_render}")
+        render_count = 0
+        for html_filename in html_files_to_render:
+            html_path = os.path.join(output_dir, html_filename)
+            hires_png_filename = f"{Path(html_filename).stem}_hires.png"
+            hires_png_path = os.path.join(output_dir, hires_png_filename)
+            print(f"  Rendering: {html_filename} -> {hires_png_filename}")
+
+            try:
+                file_uri = f"file://{os.path.abspath(html_path)}"
+                driver.get(file_uri)
+                # Increase wait time significantly for layout stabilization in potentially large viewport
+                time.sleep(8)
+                success = driver.save_screenshot(hires_png_path)
+
+                if not success:
+                     print(f"    ⚠️ driver.save_screenshot reported failure for {html_filename}")
+                elif not os.path.exists(hires_png_path):
+                     print(f"    ⚠️ Screenshot file not found after saving: {hires_png_path}")
+                else:
+                     print(f"    ✅ Saved high-resolution render: {hires_png_filename}")
+                     render_count += 1
+
+            except Exception as render_e:
+                print(f"    ❌ Error rendering {html_filename}: {render_e}")
+
+        print(f"\nGenerated {render_count} high-resolution static renders.")
+
+    # Clean up Selenium
+    print("Closing headless browser...")
+    driver.quit()
+
+print("\n--- Ego Network & High-Res Render Generation Finished ---")
+# Optional: List newly generated files
+print("\nNewly generated files in results directory might include:")
+try:
+    # List files starting with ego_ or ending with _hires.png
+    new_files = [f for f in os.listdir(output_dir) if f.startswith("ego_") or f.endswith("_hires.png")]
+    if new_files:
+        for nf in sorted(new_files): print(f" - {nf}")
+    else:
+        print("(No ego network or hires files found matching patterns)")
+except Exception as e_list:
+    print(f"Could not list new files: {e_list}")

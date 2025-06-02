@@ -1,0 +1,1961 @@
+# -*- coding: utf-8 -*-
+"""
+Combined Topic Modeler & Interactive Knowledge Graph Builder (v3.2.8)
+
+Performs LDA Topic Modeling with visualizations and builds INTERACTIVE Knowledge Graphs
+using NetworkX and PyVis, integrating topic information.
+Includes optional external API integration (Graph-Mind).
+
+Improvements:
+- Replaced static KG PNGs with interactive HTML visualizations (pyvis).
+- Generates KG views colored by Type, Community, and Topic.
+- Enhanced visualization function with filtering and better node representation.
+- Added string escaping to prevent JSONDecodeError during pyvis HTML generation.
+- Added download for NLTK 'punkt_tab' resource to fix sentence tokenization errors.
+- FIX v3.2.5: Corrected community detection call (community_louvain.best_partition).
+- FIX v3.2.5: Modified Document-Topic plot call to avoid potential 'NoneType' division error.
+- FIX v3.2.5: Enhanced pyvis saving/display logic for robustness & improved string escaping.
+- NEW v3.2.6: Added 'max_nodes_to_display' parameter to show_interactive_kg to limit nodes by degree.
+- FIX v3.2.7: Adjusted PyVis physics parameters for calmer node movement.
+- FIX v3.2.8: Improved installation robustness for community detection & added restart instructions.
+"""
+
+### SECTION 1: INSTALL LIBRARIES ###
+# ------------------------------------
+print("--- Section 1: Installing Libraries ---")
+# Added pyvis and python-louvain for interactive KG and community detection
+# REMOVED --quiet to show installation details and potential errors
+!pip install pypdf nltk scikit-learn wordcloud matplotlib seaborn pandas spacy networkx gradio_client requests beautifulsoup4 pyvis python-louvain
+
+# --- Optional: If restarting doesn't fix community detection, uncomment and run this cell, then restart runtime again ---
+# print("\nForcing reinstall of python-louvain and networkx (if needed)...")
+# !pip install --force-reinstall --no-cache-dir python-louvain networkx
+# ---
+
+print("\nLibraries potentially installed or updated.")
+print("\n*** IMPORTANT: Please RESTART THE RUNTIME/KERNEL now before running subsequent cells! ***")
+print("(In Colab: Runtime > Restart runtime)")
+print("(In Jupyter: Kernel > Restart)")
+print("-" * 30, "\n")
+
+
+### SECTION 2: IMPORT LIBRARIES ###
+# ------------------------------------
+print("--- Section 2: Importing Libraries ---")
+import os
+import re
+import warnings
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+import pickle
+import time
+import io
+from collections import Counter, defaultdict
+from pathlib import Path # For cleaner path handling
+
+from google.colab import files
+from pypdf import PdfReader # Updated from PyPDF2
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import word_tokenize, sent_tokenize
+
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.metrics.pairwise import cosine_similarity
+from wordcloud import WordCloud
+import scipy.cluster.hierarchy as sch
+
+import networkx as nx
+import requests
+from bs4 import BeautifulSoup
+from IPython.display import HTML, display, Markdown
+
+# --- Imports for INTERACTIVE KG ---
+from pyvis.network import Network
+try:
+    # Ensure the correct library is imported AFTER installation and runtime restart
+    import community as community_louvain # For community detection
+    COMMUNITY_DETECTION_AVAILABLE = True
+    print("Successfully imported 'community as community_louvain'.")
+except ImportError:
+    print("⚠️ Warning: Failed to import 'community' library (python-louvain). Community detection will be skipped.")
+    COMMUNITY_DETECTION_AVAILABLE = False
+    community_louvain = None # Define as None to avoid NameErrors later
+except Exception as e_comm_import:
+    print(f"⚠️ Warning: Error importing 'community' library: {e_comm_import}. Community detection will be skipped.")
+    COMMUNITY_DETECTION_AVAILABLE = False
+    community_louvain = None # Define as None
+
+# --- Optional: Debugging block if community detection still fails after restart ---
+# print("\n--- Verifying Community Detection Import (Debug Info) ---")
+# if 'community_louvain' in locals() and community_louvain is not None:
+#     try:
+#         print(f"Module location: {community_louvain.__file__}") # See where it's coming from
+#         if hasattr(community_louvain, 'best_partition'):
+#             print("✅ 'best_partition' function FOUND in the imported module.")
+#         else:
+#             print("❌ CRITICAL: 'best_partition' function NOT FOUND in the imported module.")
+#             print("   Available attributes:", dir(community_louvain))
+#     except Exception as e_check:
+#         print(f"❌ Error checking 'community_louvain' module: {e_check}")
+# else:
+#     print("❌ 'community_louvain' module not loaded.")
+# print("-" * 30, "\n")
+# --- End Debugging block ---
+
+
+# Import and check Gradio Client
+try:
+    from gradio_client import Client
+    GRADIO_AVAILABLE = True
+except ImportError:
+    GRADIO_AVAILABLE = False
+    print("⚠️ Warning: Gradio client library not found. Graph-Mind API functionality disabled.")
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='pypdf._reader')
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning) # Ignore potential deprecations
+
+# --- Global Settings & Variables ---
+sns.set_style('whitegrid')
+topic_colors = plt.cm.tab20.colors # Use tab20 for more distinct colors (up to 20)
+output_dir = '/content/results' # Central output directory
+os.makedirs(output_dir, exist_ok=True)
+print(f"Results will be saved in: {output_dir}")
+
+# Define entity type colors (used by interactive plot)
+ENTITY_TYPE_COLORS = {
+    'PERSON': 'skyblue', 'ORG': 'lightgreen', 'GPE': 'salmon', 'LOC': '#FFFACD', # LemonChiffon
+    'PRODUCT': 'violet', 'WORK_OF_ART': 'pink', 'EVENT': 'orange', 'FAC': 'cyan',
+    'LAW': 'gold', 'NORP': 'lightcoral',
+    'DEFAULT': '#dddddd' # Default color (light grey) for unknown types or unassigned topics
+}
+
+# --- Download NLTK & spaCy models (after library imports) ---
+print("\n--- Downloading Language Models ---")
+import nltk
+# Define function to download NLTK data robustly
+def download_nltk_data(resource):
+    try:
+        # Use resource path directly for find
+        resource_path = resource if '/' in resource else f"{resource.split(':')[0]}/{resource.split(':')[-1]}"
+        nltk.data.find(resource_path)
+        print(f"NLTK resource '{resource.split('/')[-1]}' already downloaded.")
+    except LookupError:
+        # Use the base name for download
+        resource_name = resource.split('/')[-1].split(':')[-1]
+        print(f"Downloading NLTK resource '{resource_name}'...")
+        nltk.download(resource_name, quiet=True)
+        print(f"NLTK resource '{resource_name}' downloaded.")
+    except Exception as e:
+         print(f"Error checking/downloading NLTK resource '{resource}': {e}")
+
+try:
+    download_nltk_data('corpora/wordnet')
+    download_nltk_data('corpora/stopwords')
+    download_nltk_data('tokenizers/punkt')
+    download_nltk_data('tokenizers/punkt_tab')   # <<< FIX: Added punkt_tab download
+except Exception as e:
+    print(f"❌ ERROR: NLTK download failed: {e}. Subsequent steps might fail.")
+    # Decide if you want to stop: raise SystemExit("NLTK download failed.")
+
+# Download and load spaCy model
+spacy_model_name = 'en_core_web_sm'
+nlp = None # Initialize nlp
+try:
+    import spacy
+    try:
+        nlp = spacy.load(spacy_model_name)
+        print(f"spaCy model '{spacy_model_name}' loaded successfully.")
+    except OSError:
+        print(f"spaCy model '{spacy_model_name}' not found. Downloading...")
+        # Use spacy.cli.download for better handling
+        from spacy.cli import download
+        download(spacy_model_name)
+        nlp = spacy.load(spacy_model_name) # Try loading again
+        print(f"spaCy model '{spacy_model_name}' downloaded and loaded.")
+except ImportError:
+    print("❌ ERROR: spaCy library not found. Please ensure installation was successful.")
+except Exception as e:
+    print(f"❌ ERROR: spaCy download/load failed: {e}")
+
+if nlp is None:
+     print("⚠️ Warning: spaCy model could not be loaded. Knowledge Graph generation will be limited or skipped.")
+
+print("-" * 30, "\n")
+
+
+### SECTION 3: UPLOAD PDF FILES ###
+# ------------------------------------
+print("--- Section 3: Upload PDF Files ---")
+upload_dir = '/content/uploaded_pdfs_temp' # Use a distinct temp dir name
+if not os.path.exists(upload_dir): os.makedirs(upload_dir)
+
+# Clear previous uploads
+if os.path.exists(upload_dir):
+    for f in os.listdir(upload_dir):
+        file_path = os.path.join(upload_dir, f)
+        if os.path.isfile(file_path): os.remove(file_path)
+    print("Cleared previous uploads from temporary directory.")
+
+print(f"\nPlease upload your PDF journal articles.")
+# Use Colab's upload widget
+uploaded = files.upload()
+
+pdf_files_paths = [] # Store paths to uploaded files in the temp dir
+uploaded_filenames_map = {} # Map temp path to original filename
+
+if uploaded:
+    for filename, content in uploaded.items():
+        # Sanitize filename slightly for path safety
+        safe_filename = re.sub(r'[\\/*?:"<>|]', '_', filename)
+        filepath = os.path.join(upload_dir, safe_filename)
+        uploaded_filenames_map[filepath] = filename # Store original name mapping
+        with open(filepath, 'wb') as f: f.write(content)
+        # Check extension again after potential sanitization
+        if filepath.lower().endswith('.pdf'):
+             pdf_files_paths.append(filepath)
+             print(f'Saved temporary file: {safe_filename} (Original: {filename})')
+        else:
+             print(f'Skipped non-PDF file: {filename}')
+    print(f"\nSuccessfully processed {len(pdf_files_paths)} PDF files.")
+else:
+    print("\nNo files were uploaded.")
+
+print("-" * 30, "\n")
+
+
+### SECTION 4: EXTRACT TEXT, PREPROCESS (LDA & KG), STORE RAW & SENTENCES ###
+# ------------------------------------
+print("--- Section 4: Extracting & Processing Text ---")
+
+# Initialize data storage dictionaries
+pdf_contents_raw = {}    # {original_filename: raw_extracted_text}
+pdf_contents_cleaned_kg = {} # {original_filename: cleaned_text_for_kg}
+document_sentences = {} # {original_filename: [sentence1, sentence2,...]}
+extracted_texts_lda = [] # [processed_text_doc1_for_lda, ...]
+processed_file_labels_lda = [] # [original_filename_doc1, ...] - maps LDA results back
+
+# --- KG Text Cleaning Function ---
+def clean_academic_text_kg(text):
+    if not text: return ""
+    text = re.sub(r'-\n', '', text) # Remove hyphenation across lines
+    text = re.sub(r'\s+', ' ', text) # Normalize whitespace
+    text = re.sub(r'\[\d+(?:,\s*\d+)*\]', '', text) # Remove citation numbers like [1], [2, 3]
+    text = re.sub(r'Page\s*\|\s*\d+', '', text, flags=re.IGNORECASE) # Remove page number footers
+    text = re.sub(r'\b(?:https?://|www\.)\S+', '', text) # Remove URLs
+    text = re.sub(r'\bdoi:\s*\S+', '', text, flags=re.IGNORECASE) # Remove DOIs
+    # Remove common figure/table captions (basic patterns)
+    text = re.sub(r'(?:Fig|Figure|Table)\.?\s+\d+[:.\s].*?(?=\n\n|\Z)', '', text, flags=re.IGNORECASE | re.DOTALL)
+    return text.strip()
+
+# --- LDA Preprocessing Setup ---
+lemmatizer = WordNetLemmatizer()
+stop_words_set = set(stopwords.words('english'))
+# Expand stopwords - consider adding domain-specific ones if known
+custom_stopwords = {
+    'et', 'al', 'fig', 'figure', 'table', 'abstract', 'introduction', 'method', 'methods',
+    'result', 'results', 'conclusion', 'conclusions', 'discussion', 'references', 'appendix',
+    'acknowledgements', 'acknowledgment', 'supplementary', 'material', 'materials',
+    'data', 'datum', 'analysis', 'study', 'research', 'paper', 'article', 'review', 'survey',
+    'doi', 'journal', 'vol', 'issue', 'page', 'pages', 'pp', 'published', 'author', 'authors',
+    'copyright', 'reserved', 'rights', 'university', 'department', 'institute', 'college',
+    'based', 'using', 'show', 'shown', 'however', 'provide', 'provided', 'propose', 'proposed',
+    'develop', 'developed', 'evaluate', 'evaluated', 'compare', 'compared',
+    'discuss', 'discussed', 'present', 'presented', 'model', 'approach', 'technique', 'system', 'framework',
+    'therefore', 'furthermore', 'moreover', 'although', 'thus', 'hence', 'within', 'without',
+    'significant', 'novel', 'effective', 'efficient', 'example', 'section', 'chapter',
+    'number', 'respectively', 'corresponding', 'related', 'various', 'different', 'several', 'certain',
+    'well', 'also', 'may', 'might', 'could', 'would', 'must', 'should', 'per', 'one', 'two', 'three', 'first', 'second', 'third',
+    'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', # Months
+    'ie', 'eg' # Common abbreviations
+}
+stop_words_set.update(custom_stopwords)
+# --- End LDA Setup ---
+
+if not pdf_files_paths:
+    print("❌ No PDF files found to process. Upload files in Section 3.")
+else:
+    print(f"Processing {len(pdf_files_paths)} PDF files...")
+    for pdf_path in pdf_files_paths:
+        original_filename = uploaded_filenames_map.get(pdf_path, os.path.basename(pdf_path))
+        raw_text = "" # Initialize for this file
+        try:
+            print(f"  Reading: {original_filename}...")
+            reader = PdfReader(pdf_path)
+            if reader.is_encrypted:
+                 try: reader.decrypt('')
+                 except Exception: print(f"    ⚠️ Warning: Encrypted PDF {original_filename} couldn't be decrypted. Skipping."); continue
+
+            for page_num, page in enumerate(reader.pages):
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        raw_text += (page_text + " ")
+                except Exception as page_error: print(f"    ⚠️ Warning: Can't extract text from page {page_num+1} in {original_filename}. Error: {page_error}")
+
+            raw_text = raw_text.strip()
+            if not raw_text: print(f"    ⚠️ Warning: No text extracted from {original_filename}. Skipping."); continue
+
+            # 1. Store Raw Text
+            pdf_contents_raw[original_filename] = raw_text
+            print(f"    Stored raw text ({len(raw_text):,} chars).")
+
+            # 2. Clean Text for KG and Store
+            cleaned_text_kg = clean_academic_text_kg(raw_text)
+            pdf_contents_cleaned_kg[original_filename] = cleaned_text_kg
+            print(f"    Cleaned and stored text for KG ({len(cleaned_text_kg):,} chars).")
+
+
+            # 3. Split Cleaned Text into Sentences (for KG Relations)
+            try:
+                sentences = sent_tokenize(cleaned_text_kg)
+                # Filter sentences: minimum length (words and chars), avoid fragments
+                valid_sentences = [s.strip() for s in sentences if len(s.strip().split()) > 5 and len(s.strip()) > 30 and s.strip().endswith(('.', '?', '!'))]
+                if valid_sentences:
+                     document_sentences[original_filename] = valid_sentences
+                     print(f"    Stored {len(valid_sentences)} sentences for KG relations.")
+                else:
+                     print(f"    ⚠️ Warning: No valid sentences found after filtering for {original_filename}. Storing cleaned text chunk as single 'sentence'.")
+                     document_sentences[original_filename] = [cleaned_text_kg] if cleaned_text_kg else [] # Fallback
+            except Exception as e_sent:
+                 print(f"    ❌ Error tokenizing sentences for {original_filename}: {e_sent}. Storing cleaned text chunk as single 'sentence'.")
+                 document_sentences[original_filename] = [cleaned_text_kg] if cleaned_text_kg else [] # Fallback
+
+
+            # 4. Preprocess Raw Text for LDA
+            text_lda = raw_text.lower()
+            text_lda = re.sub(r'[^a-z\s]', '', text_lda) # Keep only letters and spaces
+            text_lda = re.sub(r'\s+', ' ', text_lda).strip() # Normalize whitespace
+            words = text_lda.split()
+            # Lemmatize, remove stopwords, and filter word length
+            meaningful_words = [lemmatizer.lemmatize(word) for word in words if word not in stop_words_set and len(word) > 2]
+
+            if not meaningful_words: print(f"    ⚠️ Warning: No meaningful words left in {original_filename} after LDA preprocessing. Skipping this doc for LDA."); continue
+
+            # 5. Store Processed Text & Label (for LDA)
+            extracted_texts_lda.append(" ".join(meaningful_words))
+            processed_file_labels_lda.append(original_filename)
+            print(f"    Stored preprocessed text for LDA.")
+
+        except Exception as e: print(f"    ❌ UNEXPECTED ERROR processing {original_filename}: {e}. Skipping this file.")
+
+    # --- Save intermediate results ---
+    try:
+         intermediate_data = {
+             'pdf_contents_raw': pdf_contents_raw,
+             'pdf_contents_cleaned_kg': pdf_contents_cleaned_kg,
+             'document_sentences': document_sentences,
+             'extracted_texts_lda': extracted_texts_lda,
+             'processed_file_labels_lda': processed_file_labels_lda
+         }
+         save_path = os.path.join(output_dir, 'intermediate_data.pkl')
+         with open(save_path, 'wb') as f: pickle.dump(intermediate_data, f)
+         print(f"\n✅ Intermediate data (raw text, cleaned text, sentences, LDA text) saved to {save_path}")
+    except Exception as e_save: print(f"\n⚠️ Warning: Could not save intermediate data: {e_save}")
+
+    if not extracted_texts_lda: print("\n❌ No text could be successfully processed for LDA Topic Modeling. Cannot proceed with LDA.")
+    elif len(extracted_texts_lda) != len(processed_file_labels_lda): print("\n❌ Error: Mismatch between processed texts and labels for LDA. Check processing logs.")
+    else: print(f"\n✅ Successfully processed text from {len(extracted_texts_lda)} files for LDA.")
+
+    if not pdf_contents_cleaned_kg: print("\n⚠️ No text could be successfully cleaned/stored for Knowledge Graph construction.")
+    if not document_sentences: print("\n⚠️ No sentences could be extracted/stored for Knowledge Graph relations.")
+
+
+print("-" * 30, "\n")
+
+
+### SECTION 5: TOPIC MODELING (LDA) ###
+# ------------------------------------
+print("--- Section 5: Performing Topic Modeling (LDA) ---")
+
+# !!! --- IMPORTANT: SET THIS VARIABLE --- !!!
+# Adjust this based on the number of distinct themes you expect in your documents.
+# Consider the number of documents and their diversity. Start maybe with sqrt(num_docs).
+NUMBER_OF_TOPICS = 5 # <<< Example: Set to 5, 8, 10, etc.
+# !!! ------------------------------------ !!!
+
+# Initialize LDA variables
+vectorizer = None; dtm = None; lda = None; feature_names = None; doc_topic_dist = None
+
+# Check if prerequisite data exists and is valid
+if 'extracted_texts_lda' not in locals() or not extracted_texts_lda or \
+   'processed_file_labels_lda' not in locals() or not processed_file_labels_lda or \
+   len(extracted_texts_lda) != len(processed_file_labels_lda):
+    print("❌ Cannot perform topic modeling: Missing or inconsistent preprocessed text data from Section 4.")
+else:
+    num_docs_lda = len(extracted_texts_lda)
+    # Adjust min_df dynamically: At least 2 docs or 5% of docs, whichever is smaller, but min 1.
+    min_document_frequency = max(1, min(2, int(num_docs_lda * 0.05))) if num_docs_lda >= 10 else 1
+    # Adjust max_df: Ignore terms that appear in > 90% of the documents
+    max_document_frequency = 0.90
+    # Limit vocabulary size
+    max_features_lda = 2500 # Slightly increased vocab size
+
+    print(f"Number of documents for LDA: {num_docs_lda}")
+
+    # Validate NUMBER_OF_TOPICS
+    if not isinstance(NUMBER_OF_TOPICS, int) or NUMBER_OF_TOPICS <= 0:
+        print(f"❌ Error: NUMBER_OF_TOPICS ('{NUMBER_OF_TOPICS}') must be a positive integer."); raise SystemExit("Stopping: Invalid number of topics.")
+    if num_docs_lda > 0 and NUMBER_OF_TOPICS > num_docs_lda: # Add check for num_docs_lda > 0
+        print(f"⚠️ Warning: Topics ({NUMBER_OF_TOPICS}) > Docs ({num_docs_lda}). Reducing topics to {num_docs_lda}."); NUMBER_OF_TOPICS = num_docs_lda
+    elif num_docs_lda == 0:
+        print(f"❌ Error: No documents available for LDA. Cannot set number of topics.")
+        # Handle the error gracefully, perhaps by exiting or setting LDA variables to None
+        lda = None; feature_names = None; doc_topic_dist = None
+    elif NUMBER_OF_TOPICS <= 0: # Check after potential reduction
+        print(f"❌ Error: Number of topics reduced to {NUMBER_OF_TOPICS}, must be > 0. Stopping."); raise SystemExit("Stopping: Invalid number of topics.")
+
+
+    # Proceed only if NUMBER_OF_TOPICS is valid and > 0
+    if NUMBER_OF_TOPICS > 0 and num_docs_lda > 0:
+        print(f"Setting number of topics to: {NUMBER_OF_TOPICS}")
+        print(f"Setting min_df={min_document_frequency}, max_df={max_document_frequency}, max_features={max_features_lda}")
+        print(f"Vectorizing text for LDA...")
+
+        try:
+            vectorizer = CountVectorizer(max_df=max_document_frequency,
+                                         min_df=min_document_frequency,
+                                         max_features=max_features_lda,
+                                         stop_words='english') # Use sklearn's basic list + our preprocessing handled custom ones
+            dtm = vectorizer.fit_transform(extracted_texts_lda)
+            print("Vectorization complete."); print(f"DTM shape: {dtm.shape} (Documents, Features/Words)")
+
+            if dtm.shape[1] == 0: print("\n❌ Error: DTM has 0 features. Vocabulary might be too small or too heavily filtered. Check stopwords and min/max_df."); lda = None; feature_names = None
+            elif dtm.shape[0] < NUMBER_OF_TOPICS: print(f"\n❌ Error: Docs in DTM ({dtm.shape[0]}) < Topics ({NUMBER_OF_TOPICS}). Reduce topics or add more documents."); lda = None; feature_names = None
+            else:
+                print(f"Building LDA model with {NUMBER_OF_TOPICS} topics...")
+                # Common LDA parameters:
+                # learning_method='online': Faster for large datasets
+                # n_jobs=-1: Use all available CPU cores
+                # random_state: For reproducibility
+                # max_iter: Number of passes through the data (increase for potentially better convergence)
+                # evaluate_every: How often to evaluate perplexity (slows training) - removed for speed
+                lda = LatentDirichletAllocation(n_components=NUMBER_OF_TOPICS,
+                                                random_state=42,
+                                                learning_method='online',
+                                                n_jobs=-1,
+                                                max_iter=25, # Increased iterations
+                                                )
+                lda.fit(dtm)
+                doc_topic_dist = lda.transform(dtm) # Get topic distribution for each document
+                print("✅ LDA model trained & doc-topic distributions calculated.")
+                feature_names = vectorizer.get_feature_names_out()
+
+                # --- Save LDA Model and Vectorizer ---
+                try:
+                    model_path = os.path.join(output_dir, 'lda_model.pkl')
+                    vectorizer_path = os.path.join(output_dir, 'vectorizer.pkl')
+                    with open(model_path, 'wb') as f: pickle.dump(lda, f)
+                    with open(vectorizer_path, 'wb') as f: pickle.dump(vectorizer, f)
+                    print(f"✅ LDA model saved to {model_path}")
+                    print(f"✅ Vectorizer saved to {vectorizer_path}")
+                except Exception as e_save_lda: print(f"⚠️ Warning: Could not save LDA model/vectorizer: {e_save_lda}")
+
+        except ValueError as e: print(f"\n❌ Error during vectorization/LDA: {e}. Check parameters (e.g., min_df might be too high)."); lda = None; feature_names = None; doc_topic_dist = None
+        except Exception as e: print(f"\n❌ Unexpected Error during LDA: {e}"); lda = None; feature_names = None; doc_topic_dist = None
+    elif num_docs_lda == 0:
+         print("Skipping LDA model building as there are no documents.") # Already printed error above
+
+print("-" * 30, "\n")
+
+
+### SECTION 6: DISPLAY TOPICS (Keywords) ###
+# ------------------------------------
+print("--- Section 6: Displaying Topics (Keywords) ---")
+
+NUM_TOP_WORDS = 15 # Number of keywords to display per topic
+topic_keywords = {} # Store keywords {topic_idx: [word1, word2,...]}
+
+# Check prerequisites for this section
+if 'lda' not in locals() or lda is None or \
+   'feature_names' not in locals() or feature_names is None or \
+   len(feature_names) == 0:
+    print("❌ Cannot display topics: LDA model or features not available from Section 5.")
+else:
+    # Ensure NUMBER_OF_TOPICS reflects the actual components in the trained model
+    ACTUAL_NUMBER_OF_TOPICS = lda.n_components
+    print(f"\nTop {NUM_TOP_WORDS} words for each of the {ACTUAL_NUMBER_OF_TOPICS} topics found:\n")
+    for topic_idx, topic_weights in enumerate(lda.components_):
+        # Ensure we don't request more words than available features
+        num_words_to_show = min(NUM_TOP_WORDS, len(feature_names))
+        # Get indices of top words for this topic
+        top_word_indices = topic_weights.argsort()[:-num_words_to_show - 1:-1]
+        # Get the actual words
+        top_words = [feature_names[i] for i in top_word_indices]
+        topic_keywords[topic_idx] = top_words
+        # Use 1-based indexing for display
+        print(f"Topic #{topic_idx + 1}: {', '.join(top_words)}")
+
+    print("\n\n--- Interpretation Guide ---")
+    print("- Review the keywords for each topic. Do they represent distinct, coherent themes?")
+    print("- If topics seem mixed or unclear, consider:")
+    print("  - Adjusting NUMBER_OF_TOPICS in Section 5 (increase if themes are merged, decrease if too fragmented).")
+    print("  - Refining custom_stopwords in Section 4 (add irrelevant common words from the keywords).")
+    print("  - Adjusting LDA parameters (max_df, min_df, max_features) in Section 5.")
+    print("- Re-run the script from Section 4 or 5 after making changes.")
+
+    # Save topic keywords to a file
+    try:
+        # Create a DataFrame for easy saving (Use 1-based topic index)
+        df_topics = pd.DataFrame([{'Topic': f"Topic {i+1}", 'Keywords': ", ".join(words)} for i, words in topic_keywords.items()])
+        topics_path = os.path.join(output_dir, 'topic_keywords.csv')
+        df_topics.to_csv(topics_path, index=False)
+        print(f"\n✅ Topic keywords saved to {topics_path}")
+    except Exception as e_save_topics:
+         print(f"\n⚠️ Warning: Could not save topic keywords: {e_save_topics}")
+
+print("\n" + "-" * 30)
+print("Run Section 7 next for Topic Modeling visualizations.")
+print("-" * 30, "\n")
+
+
+### SECTION 7: TOPIC MODELING VISUALIZATIONS ###
+# ------------------------------------
+# Note: These visualizations relate to the LDA topic model itself, not the KG structure.
+print("--- Section 7: Generating Topic Modeling Visualizations ---")
+
+# Check if necessary components exist for visualization
+if 'lda' not in locals() or lda is None or \
+   'dtm' not in locals() or dtm is None or \
+   'feature_names' not in locals() or feature_names is None or len(feature_names) == 0 or \
+   'doc_topic_dist' not in locals() or doc_topic_dist is None or \
+   'processed_file_labels_lda' not in locals() or not processed_file_labels_lda or \
+   len(processed_file_labels_lda) != doc_topic_dist.shape[0]: # Check alignment
+    print("❌ Cannot generate TM visualizations: missing or inconsistent data from previous steps (LDA model, DTM, features, doc-topic distributions, labels).")
+else:
+    # Use the actual number of topics from the trained model
+    ACTUAL_NUMBER_OF_TOPICS_VIZ = lda.n_components
+    num_docs_viz = len(processed_file_labels_lda)
+    print(f"Preparing TM visualizations for {num_docs_viz} documents and {ACTUAL_NUMBER_OF_TOPICS_VIZ} topics...")
+
+    # --- Visualization 1: Word Clouds per Topic ---
+    print("\nGenerating Word Clouds...")
+    try:
+        # Normalize topic-word distributions
+        topic_word_distributions = lda.components_ / lda.components_.sum(axis=1)[:, np.newaxis]
+
+        # Determine grid layout
+        cols = min(3, ACTUAL_NUMBER_OF_TOPICS_VIZ) if ACTUAL_NUMBER_OF_TOPICS_VIZ > 0 else 1
+        rows = int(np.ceil(ACTUAL_NUMBER_OF_TOPICS_VIZ / cols)) if cols > 0 else 0
+
+        if rows > 0 and cols > 0 : # Check if layout is valid
+            plt.figure(figsize=(6 * cols, 5 * rows))
+
+            for topic_idx, topic_weights in enumerate(topic_word_distributions):
+                # Get top 50 words and their frequencies for the word cloud
+                num_wc_words = min(50, len(feature_names))
+                top_indices = topic_weights.argsort()[:-num_wc_words - 1:-1]
+                top_word_freq = {feature_names[i]: topic_weights[i] for i in top_indices if i < len(feature_names)}
+
+                ax = plt.subplot(rows, cols, topic_idx + 1)
+                try:
+                    if not top_word_freq: raise ValueError("No words found for this topic.")
+                    wordcloud = WordCloud(width=400, height=300, background_color='white',
+                                          max_words=num_wc_words, colormap='viridis',
+                                          prefer_horizontal=0.9, random_state=42).generate_from_frequencies(top_word_freq)
+                    ax.imshow(wordcloud, interpolation='bilinear')
+                    ax.set_title(f'Topic #{topic_idx + 1}', fontsize=14) # Use 1-based index
+                except ValueError as e:
+                    print(f"  ⚠️ Warning: Word Cloud generation error for Topic {topic_idx + 1}: {e}")
+                    ax.text(0.5, 0.5, f'Topic {topic_idx + 1}\n(Error generating cloud)', ha='center', va='center', fontsize=10, color='red')
+                ax.axis('off')
+
+            plt.tight_layout(pad=3.0)
+            plt.suptitle("Word Clouds for Each Topic", fontsize=18, y=1.03 if rows > 1 else 1.05)
+            wc_path = os.path.join(output_dir, 'topic_wordclouds.png')
+            plt.savefig(wc_path, dpi=300, bbox_inches='tight')
+            plt.show()
+            print(f"✅ Word Clouds saved to {wc_path}")
+        else:
+             print("  Skipping word cloud generation: No topics to visualize.")
+    except Exception as e_wc:
+        print(f"❌ Error generating word clouds: {e_wc}")
+
+
+    # --- Visualization 2: Topic Prevalence Bar Chart ---
+    print("\nGenerating Topic Prevalence Chart...")
+    try:
+        topic_prevalence = doc_topic_dist.mean(axis=0) # Average proportion of each topic across all docs
+        plt.figure(figsize=(max(8, ACTUAL_NUMBER_OF_TOPICS_VIZ * 0.8), 6))
+        topic_nums = [f"Topic {i+1}" for i in range(ACTUAL_NUMBER_OF_TOPICS_VIZ)] # 1-based
+        sns.barplot(x=topic_nums, y=topic_prevalence, palette="viridis")
+        plt.title('Average Topic Prevalence Across All Documents', fontsize=16)
+        plt.xlabel('Topic', fontsize=12)
+        plt.ylabel('Average Prevalence Score', fontsize=12)
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        tp_path = os.path.join(output_dir, 'topic_prevalence.png')
+        plt.savefig(tp_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"✅ Topic Prevalence Chart saved to {tp_path}")
+    except Exception as e_tp:
+        print(f"❌ Error generating topic prevalence chart: {e_tp}")
+
+
+    # --- Visualization 3: Thematic Map (Topic Relationship Clustermap) ---
+    print("\nGenerating Thematic Map (Clustermap)...")
+    if ACTUAL_NUMBER_OF_TOPICS_VIZ > 1:
+        try:
+            # Use topic-word distributions for similarity calculation
+            topic_word_distributions_norm = lda.components_ / lda.components_.sum(axis=1)[:, np.newaxis]
+            topic_similarity_matrix = cosine_similarity(topic_word_distributions_norm)
+            topic_labels = [f"Topic {i+1}" for i in range(ACTUAL_NUMBER_OF_TOPICS_VIZ)] # 1-based
+            df_topic_similarity = pd.DataFrame(topic_similarity_matrix, index=topic_labels, columns=topic_labels)
+
+            print("  Calculating clusters and plotting heatmap...")
+            # Use seaborn's clustermap
+            cluster_map = sns.clustermap(df_topic_similarity,
+                                         method='ward',          # Clustering method
+                                         cmap="viridis",         # Color map
+                                         linewidths=0.5,         # Line width between cells
+                                         linecolor='lightgray',  # Line color
+                                         annot=True,             # Show similarity values
+                                         fmt=".2f",              # Format for annotations
+                                         figsize=(max(8, ACTUAL_NUMBER_OF_TOPICS_VIZ*0.9),
+                                                  max(8, ACTUAL_NUMBER_OF_TOPICS_VIZ*0.9)))
+
+            cluster_map.fig.suptitle('Thematic Map: Topic Similarity Clustermap', y=1.02, fontsize=16)
+            # Adjust label rotation for readability
+            plt.setp(cluster_map.ax_heatmap.get_xticklabels(), rotation=45, ha='right')
+            plt.setp(cluster_map.ax_heatmap.get_yticklabels(), rotation=0)
+
+            tm_path = os.path.join(output_dir, 'thematic_map_clustermap.png')
+            plt.savefig(tm_path, dpi=300, bbox_inches='tight')
+            plt.show()
+            print(f"✅ Thematic Map (Clustermap) saved to {tm_path}")
+            print("  Interpretation: Topics clustered together are more similar based on their keyword distributions. Brighter cells indicate higher similarity.")
+        except Exception as e_tm:
+            print(f"  ❌ Error generating Clustermap: {e_tm}")
+    else:
+        print("  Skipping Thematic Map: requires more than 1 topic.")
+
+
+    # --- Visualization 4: Document-Topic Distribution (Stacked Bar Chart) ---
+    print("\nGenerating Document-Topic Distribution Chart...")
+    try:
+        if num_docs_viz > 0 and ACTUAL_NUMBER_OF_TOPICS_VIZ > 0: # Ensure data exists
+            topic_names = [f"Topic {i+1}" for i in range(ACTUAL_NUMBER_OF_TOPICS_VIZ)] # 1-based
+            # Create DataFrame using the correct labels from LDA processing
+            df_doc_topic = pd.DataFrame(doc_topic_dist, columns=topic_names, index=processed_file_labels_lda)
+
+            # Choose plot orientation based on number of documents
+            plot_kind = 'bar'
+            fig_height = max(7, num_docs_viz * 0.5)
+            fig_width = 14
+            if num_docs_viz > 25: # Switch to horizontal slightly later
+                print("  Info: Using horizontal bars for >25 documents for better readability.")
+                plot_kind = 'barh'
+                # Swap width and height for horizontal plot
+                fig_width, fig_height = fig_height, fig_width
+
+            # --- FIX: Define plot parameters separately to avoid passing width=None ---
+            plot_params = {
+                'kind': plot_kind,
+                'stacked': True,
+                'figsize': (fig_width, fig_height),
+                'colormap': 'viridis',
+                'fontsize': 10
+            }
+            if plot_kind == 'bar':
+                plot_params['width'] = 0.8 # Only set width for vertical bars
+
+            ax = df_doc_topic.plot(**plot_params) # Use parameter unpacking
+            # --- End Fix ---
+
+            ax.set_title('Topic Distribution Across Documents', fontsize=16)
+
+            if plot_kind == 'bar':
+                ax.set_xlabel('Documents', fontsize=12)
+                ax.set_ylabel('Topic Proportion', fontsize=12)
+                plt.xticks(rotation=90)
+                plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent label cutoff
+                ax.legend(title='Topics', bbox_to_anchor=(1.02, 1), loc='upper left', fontsize='medium')
+            else: # Horizontal bar chart
+                ax.set_xlabel('Topic Proportion', fontsize=12)
+                ax.set_ylabel('Documents', fontsize=12)
+                plt.gca().invert_yaxis()
+                plt.tight_layout(rect=[0.15, 0, 0.85, 0.95]) # Adjust layout
+                ax.legend(title='Topics', bbox_to_anchor=(1.02, 1), loc='upper left', fontsize='medium')
+
+            dtd_path = os.path.join(output_dir, 'document_topic_distribution.png')
+            plt.savefig(dtd_path, dpi=300, bbox_inches='tight')
+            plt.show()
+            print(f"✅ Document-Topic Distribution chart saved to {dtd_path}")
+        else:
+             print("  Skipping Document-Topic chart: No documents or topics to plot.")
+    except Exception as e_dtd:
+         print(f"  ❌ Error generating Document-Topic chart: {e_dtd}")
+
+print("\n" + "-" * 30)
+print("✅ Topic Modeling & Visualization Phase Complete.")
+print("-" * 30, "\n")
+
+
+# ==============================================================================
+# =================== KNOWLEDGE GRAPH SECTIONS START HERE ======================
+# ==============================================================================
+
+### SECTION 8: KG HELPER FUNCTIONS ###
+# ------------------------------------
+print("--- Section 8: Defining Knowledge Graph Helper Functions ---")
+
+# --- Helper Function to Escape Strings for JavaScript/JSON ---
+# FIX: Enhanced escaping for control characters
+def escape_js_string(value):
+    """Escapes characters in a string for safe embedding in JavaScript/JSON."""
+    if not isinstance(value, str):
+        return value # Only escape strings
+    # Replace backslash first, then other problematic chars
+    value = value.replace('\\', '\\\\')
+    value = value.replace('"', '\\"')
+    value = value.replace("'", "\\'") # Also escape single quotes
+    value = value.replace('\n', '\\n') # Escape newlines
+    value = value.replace('\r', '\\r') # Escape carriage returns
+    value = value.replace('\t', '\\t') # Escape tabs
+    # Escape control characters (0x00-0x1F) which can break JSON/JS
+    value = re.sub(r'[\x00-\x1f]', lambda m: f'\\u{ord(m.group(0)):04x}', value)
+    return value
+
+print("Defining helper function 'escape_js_string'...")
+
+
+# --- NetworkX KG Functions ---
+
+def extract_entities_kg(text, filename="Unknown", spacy_nlp_model=None):
+    """Extract named entities using spaCy, filtering for relevance."""
+    if spacy_nlp_model is None:
+        print(f"  ⚠️ Skipping entity extraction for {filename}: spaCy model not loaded.")
+        return []
+    if not text or not text.strip():
+        print(f"  ⚠️ Skipping entity extraction for {filename}: Empty text provided.")
+        return []
+
+    entities = []
+    # Define entity types of interest - customize as needed
+    relevant_labels = {'PERSON', 'ORG', 'GPE', 'LOC', 'PRODUCT', 'WORK_OF_ART', 'EVENT', 'FAC', 'LAW', 'NORP'}
+
+    # Process text in manageable chunks
+    chunk_size = 500000
+    text_len = len(text)
+    print(f"  Processing {filename} ({text_len:,} chars) for entities...")
+
+    for i in range(0, text_len, chunk_size):
+        chunk = text[i:i+chunk_size]
+        try:
+            # Increase max_length if needed, but beware of memory usage
+            # spacy_nlp_model.max_length = len(chunk) + 100 # Uncomment if hitting length limits
+            doc = spacy_nlp_model(chunk)
+            for ent in doc.ents:
+                if ent.label_ in relevant_labels:
+                    cleaned_text = ent.text.strip()
+                    # Filter out very short, purely numeric, or single-character entities
+                    if cleaned_text and len(cleaned_text) > 1 and not cleaned_text.isdigit():
+                         entities.append({'text': cleaned_text, 'label': ent.label_})
+        except ValueError as ve:
+             if "is longer than the model's maximum sequence length" in str(ve):
+                 print(f"  ⚠️ Warning: Chunk {i // chunk_size + 1} for {filename} exceeds spaCy max length. Try reducing chunk_size or using a transformer model.")
+             else: print(f"  ❌ Error processing entity chunk {i // chunk_size + 1} for {filename}: {ve}")
+             continue
+        except Exception as e:
+            chunk_num = i // chunk_size + 1
+            print(f"  ❌ Error processing entity chunk {chunk_num} for {filename}: {e}")
+            continue
+
+    if not entities:
+        print(f"  No relevant entities extracted from {filename}.")
+        return []
+
+    # --- Filter Entities Based on Frequency and Length ---
+    entity_counts = Counter(e['text'].lower() for e in entities)
+    min_freq = 2 # Entity must appear at least twice
+    min_len_if_single = 12 # Keep longer entities (e.g., multi-word) even if they appear only once
+    filtered_entities = [
+        e for e in entities
+        if entity_counts[e['text'].lower()] >= min_freq or len(e['text']) >= min_len_if_single
+    ]
+
+    print(f"  Extracted {len(entities)} raw entities, filtered to {len(filtered_entities)} relevant entities based on frequency/length.")
+    return filtered_entities
+
+
+def extract_relations_kg(sentences, entities, filename="Unknown", max_distance_words=15):
+    """Extract relations between entities co-occurring within sentences."""
+    if not sentences:
+        print(f"  Skipping relation extraction for {filename}: No sentences provided.")
+        return []
+    if not entities:
+        print(f"  Skipping relation extraction for {filename}: No entities provided.")
+        return []
+
+    relations = []
+    # Create a lookup: lowercase entity text -> original casing entity dict
+    entity_lookup = {e['text'].lower(): e for e in entities}
+    # Sort entity texts by length descending for better matching (match longer entities first)
+    entity_texts_sorted = sorted(list(entity_lookup.keys()), key=len, reverse=True)
+
+    print(f"  Extracting relations for {filename} ({len(sentences)} sentences)...")
+    processed_sentence_pairs = set()
+
+    for sentence_index, sentence in enumerate(sentences):
+        sentence_lower = sentence.lower()
+        # Find entities present in this sentence using the pre-sorted list
+        found_entities_in_sentence = []
+        temp_sentence_lower = sentence_lower # Work on a temporary copy for replacements
+        for et_lower in entity_texts_sorted:
+            # Use word boundaries to avoid partial matches within words
+            pattern = r'\b' + re.escape(et_lower) + r'\b'
+            match = re.search(pattern, temp_sentence_lower)
+            if match:
+                found_entities_in_sentence.append(et_lower)
+                # Optional: Blank out matched entity to prevent re-matching subsets
+                # temp_sentence_lower = temp_sentence_lower[:match.start()] + ' ' * len(et_lower) + temp_sentence_lower[match.end():]
+
+        if len(found_entities_in_sentence) < 2: continue
+
+        # Iterate through unique pairs in the sentence
+        for i in range(len(found_entities_in_sentence)):
+            for j in range(i + 1, len(found_entities_in_sentence)):
+                e1_lower = found_entities_in_sentence[i]
+                e2_lower = found_entities_in_sentence[j]
+                # Retrieve original casing from lookup
+                e1_orig = entity_lookup[e1_lower]['text']
+                e2_orig = entity_lookup[e2_lower]['text']
+
+                # Avoid self-loops and ensure distinct entities
+                if e1_lower == e2_lower: continue
+
+                # Create a canonical key for the pair to avoid duplicates per sentence
+                pair_key = tuple(sorted((e1_lower, e2_lower)))
+                sentence_pair_key = (sentence_index,) + pair_key
+                if sentence_pair_key in processed_sentence_pairs: continue
+
+                try:
+                    # Find positions using regex word boundaries in the original sentence_lower
+                    e1_match = re.search(r'\b' + re.escape(e1_lower) + r'\b', sentence_lower)
+                    e2_match = re.search(r'\b' + re.escape(e2_lower) + r'\b', sentence_lower)
+                    if not e1_match or not e2_match: continue # Should not happen if found above, but safety check
+
+                    pos1, end1 = e1_match.start(), e1_match.end()
+                    pos2, end2 = e2_match.start(), e2_match.end()
+
+                    # Determine source/target and text between them
+                    if pos1 < pos2:
+                        source_entity, target_entity = e1_orig, e2_orig
+                        start_index, end_index = end1, pos2
+                    else:
+                        source_entity, target_entity = e2_orig, e1_orig
+                        start_index, end_index = end2, pos1
+
+                    # Extract text between entities from the *original* sentence
+                    between_text = sentence[start_index:end_index].strip()
+                    # Basic cleaning of the relation text
+                    relation_text = re.sub(r'^[^\w]+|[^\w]+$', '', between_text).strip() # Remove leading/trailing non-word chars
+                    relation_text = re.sub(r'\s+', ' ', relation_text) # Normalize whitespace
+                    num_words = len(relation_text.split())
+
+                    # Filter relation quality: word count, length, avoid trivial words
+                    if 1 < num_words < max_distance_words and \
+                       3 < len(relation_text) < 100 and \
+                       relation_text.lower() not in ('and', 'of', 'the', 'in', 'is', 'a', 'an', 'with', 'for', 'as', 'by', 'on', 'at', 'to'):
+                        relations.append({
+                            'source': e1_lower, # Use lowercase for graph node ID
+                            'target': e2_lower, # Use lowercase for graph node ID
+                            'source_label': source_entity, # Keep original casing for labels/display
+                            'target_label': target_entity,
+                            'relation': relation_text,
+                            'sentence': sentence # Store original sentence context
+                        })
+                        processed_sentence_pairs.add(sentence_pair_key) # Mark pair as processed for this sentence
+
+                except Exception as rel_err:
+                     # print(f"    Debug: Error extracting relation between '{e1_lower}' and '{e2_lower}' in sentence {sentence_index}: {rel_err}")
+                     pass # Ignore errors for specific pairs/sentences
+
+    print(f"  Extracted {len(relations)} potential relations for {filename}.")
+    return relations
+
+
+def build_knowledge_graph_kg(entities, relations):
+    """Builds a NetworkX DiGraph from extracted entities and relations."""
+    G = nx.DiGraph()
+    print("Building NetworkX knowledge graph...")
+
+    if not entities:
+        print("⚠️ No entities provided, graph will be empty.")
+        return G
+
+    # Add nodes using lowercase entity text as the node ID
+    entity_map = {} # Stores node_id -> {label, type}
+    node_count = 0
+    skipped_long_nodes = 0
+    for e in entities:
+        node_id = e['text'].lower()
+        # Skip extremely long strings which might be parsing errors
+        if len(node_id) > 150:
+            skipped_long_nodes += 1
+            continue
+        # Add node only if it's new
+        if node_id not in entity_map:
+            G.add_node(node_id, label=e['text'], type=e['label'])
+            entity_map[node_id] = {'label': e['text'], 'type': e['label']}
+            node_count += 1
+    if skipped_long_nodes > 0: print(f"  Skipped {skipped_long_nodes} nodes due to excessive length (>150 chars).")
+    print(f"Added {node_count} unique entity nodes.")
+
+    # Add edges based on extracted relations
+    edge_count = 0
+    skipped_edges = 0
+    skipped_long_rel = 0
+    aggregated_relations = defaultdict(lambda: defaultdict(int)) # (src,tgt) -> {relation_text: count}
+
+    if relations:
+        for rel in relations:
+            source_id = rel['source'].lower() # Already lowercase from extraction
+            target_id = rel['target'].lower()
+            relation_text = rel['relation']
+
+            # Skip excessively long relations
+            if len(relation_text) > 150:
+                skipped_long_rel += 1
+                continue
+
+            # Check if source and target nodes exist in the graph (added from entities)
+            if source_id in G and target_id in G:
+                # Aggregate relations, counting occurrences
+                aggregated_relations[(source_id, target_id)][relation_text] += 1
+            else:
+                # This happens if an entity in a relation wasn't in the filtered entity list
+                skipped_edges += 1
+
+        # Add aggregated edges to the graph
+        for (source_id, target_id), rel_counts in aggregated_relations.items():
+            # Choose how to represent multiple relations:
+            # Option 1: Combine unique relations, sorted
+            # combined_relation = "; ".join(sorted(list(rel_counts.keys())))
+            # Option 2: Take the most frequent relation text
+            most_frequent_relation = max(rel_counts, key=rel_counts.get)
+            combined_relation = most_frequent_relation
+
+            # Calculate a weight based on total frequency
+            total_occurrences = sum(rel_counts.values())
+            G.add_edge(source_id, target_id, relation=combined_relation, weight=total_occurrences)
+            edge_count += 1
+
+    if skipped_long_rel > 0: print(f"  Skipped {skipped_long_rel} relations due to excessive length (>150 chars).")
+    print(f"Processed {len(relations)} relation instances: Added {edge_count} unique aggregated edges. Skipped {skipped_edges} potential edges (missing nodes).")
+
+    # Basic graph stats
+    num_nodes = G.number_of_nodes()
+    num_edges = G.number_of_edges()
+    print(f"Final graph: {num_nodes} nodes, {num_edges} edges.")
+    if num_nodes > 0 and num_edges > 0 :
+        try:
+             density = nx.density(G)
+             print(f"Graph density: {density:.4f}")
+             # Add component info
+             if G.is_directed():
+                 num_wcc = nx.number_weakly_connected_components(G)
+                 print(f"Weakly connected components: {num_wcc}")
+                 # Strong components can be numerous, maybe just show count
+                 # num_scc = nx.number_strongly_connected_components(G)
+                 # print(f"Strongly connected components: {num_scc}")
+             else: # Should be directed, but just in case
+                 num_cc = nx.number_connected_components(G)
+                 print(f"Connected components: {num_cc}")
+        except Exception as e: print(f"Could not calculate density/components: {e}")
+
+    return G
+
+
+def assign_topics_to_entities_kg(G, lda_model, vectorizer, document_sentences_map, all_relations):
+    """Assigns the most relevant LDA topic to each entity node in the graph."""
+    if not isinstance(G, nx.Graph) or G.number_of_nodes() == 0:
+        print("Cannot assign topics: Graph is invalid or empty.")
+        return False
+    if lda_model is None or vectorizer is None:
+        print("Cannot assign topics: LDA model or vectorizer not available.")
+        return False
+    if not document_sentences_map and not all_relations:
+        print("Cannot assign topics: No sentences or relations context provided.")
+        return False
+
+    print("Assigning topics to entities based on sentence context...")
+    sentence_topic_map = {} # Stores {sentence_object: topic_index}
+
+    # --- Choose context source ---
+    # Prefer using sentences directly involved in relations as they link entities
+    context_source = None
+    context_source_name = "unknown"
+    if all_relations:
+        sentences_from_relations = list(set(rel['sentence'] for rel in all_relations if 'sentence' in rel and isinstance(rel['sentence'], str)))
+        if sentences_from_relations:
+            context_source = sentences_from_relations
+            context_source_name = "relations"
+            print(f"  Using {len(context_source)} unique sentences from relations as context.")
+        else:
+            print("  No sentence context found in relations. Trying all document sentences.")
+
+    if context_source is None and document_sentences_map:
+        # Fallback to using all valid sentences from documents
+        all_sentences_list = []
+        for filename, sentences in document_sentences_map.items():
+             if sentences and isinstance(sentences, list):
+                 all_sentences_list.extend([s for s in sentences if isinstance(s, str) and s.strip()])
+        if all_sentences_list:
+            context_source = all_sentences_list
+            context_source_name = "all documents"
+            print(f"  Using {len(context_source)} sentences from all documents as context.")
+        else:
+            print("  No valid sentences found in document_sentences_map.")
+
+    if not context_source:
+        print("  ❌ No sentence context available. Cannot assign topics.")
+        return False
+
+    # --- Calculate topic distribution for context sentences ---
+    try:
+        # Preprocess sentences similar to LDA training text (lowercase, basic cleanup)
+        # Note: Vectorizer might ignore words not seen in training (OOV)
+        processed_sents = [re.sub(r'[^a-z\s]', '', s.lower()).strip() for s in context_source]
+        # Filter out potentially empty strings after processing
+        valid_processed_sents = [(orig_s, proc_s) for orig_s, proc_s in zip(context_source, processed_sents) if proc_s]
+        if not valid_processed_sents:
+             print("  ❌ No valid sentences remaining after preprocessing for topic assignment.")
+             return False
+
+        original_sents_for_mapping, sents_to_transform = zip(*valid_processed_sents)
+
+        print(f"  Transforming {len(sents_to_transform)} sentences from {context_source_name} to get topic distributions...")
+        X_sentences = vectorizer.transform(sents_to_transform)
+        sentence_topic_dist = lda_model.transform(X_sentences)
+        dominant_topics = sentence_topic_dist.argmax(axis=1)
+        # Map original sentence object to its dominant topic index
+        sentence_topic_map = {sent_obj: topic_idx for sent_obj, topic_idx in zip(original_sents_for_mapping, dominant_topics)}
+        print(f"  Mapped topics for {len(sentence_topic_map)} context sentences.")
+    except Exception as e:
+        print(f"❌ Error calculating topics for sentences: {e}")
+        return False
+
+
+    # --- Aggregate topic scores for each entity based on sentences it appears in ---
+    print("  Aggregating topic scores for entities...")
+    entity_topic_scores = defaultdict(lambda: defaultdict(int)) # entity_id -> {topic_idx: count}
+    entities_found_count = 0
+
+    # Iterate through sentences and entities found within them
+    for sentence_text, topic_idx in sentence_topic_map.items():
+        sentence_lower = sentence_text.lower()
+        # Check which entities (lowercase IDs from graph nodes) are present in this sentence
+        for entity_id, node_data in G.nodes(data=True):
+            # Use the entity's label for matching within the sentence text (more robust than ID)
+            entity_label_lower = node_data.get('label', entity_id).lower()
+            # Use regex word boundaries for more accurate matching
+            if re.search(r'\b' + re.escape(entity_label_lower) + r'\b', sentence_lower):
+                entity_topic_scores[entity_id][topic_idx] += 1
+                entities_found_count += 1 # Count occurrences in context
+
+    if entities_found_count == 0:
+         print("  ⚠️ No entities from the graph were found in the topic-mapped sentences. Cannot assign topics.")
+         return False
+
+    # Assign the dominant topic to each entity node based on aggregated scores
+    assigned_count = 0
+    for entity_id, topic_counts in entity_topic_scores.items():
+        if topic_counts: # If the entity was found in any topic-mapped sentences
+            # Find the topic index with the maximum count for this entity
+            dominant_topic_for_entity = max(topic_counts, key=topic_counts.get)
+            # Assign the topic index as an attribute to the node in the graph
+            if entity_id in G:
+                G.nodes[entity_id]['topic'] = int(dominant_topic_for_entity) # Store 0-based index
+                assigned_count += 1
+
+    total_entities = G.number_of_nodes()
+    print(f"  Assigned dominant topics to {assigned_count} / {total_entities} entities in the graph based on context.")
+    if assigned_count == 0:
+         print("  ⚠️ Although entities were found in context sentences, could not assign dominant topic to any node.")
+    return assigned_count > 0
+
+
+# --- Graph-Mind API Class (Optional - No changes needed here) ---
+class KnowledgeGraphBuilderAPI:
+    """Handles interaction with the optional Graph-Mind Gradio API."""
+    def __init__(self, use_gradio=True):
+        self.use_gradio = use_gradio and GRADIO_AVAILABLE
+        self.client = None
+        self.api_endpoint = "ginigen/Graph-Mind" # API endpoint on Hugging Face Spaces
+
+        if self.use_gradio:
+            print("Initializing Graph-Mind API connection...")
+            try:
+                self.client = Client(self.api_endpoint)
+                print(f"✅ Connected to Graph-Mind API: {self.api_endpoint}")
+            except Exception as e:
+                print(f"❌ Error connecting to Graph-Mind API ({self.api_endpoint}): {e}")
+                print("  Check if the API is running and if gradio_client is installed correctly.")
+                self.client = None
+        else:
+            if not GRADIO_AVAILABLE: print("Graph-Mind API disabled (gradio_client not found).")
+            else: print("Graph-Mind API disabled by choice.")
+
+    def _clean_text_for_api(self, text):
+        text = re.sub(r'\n\s*\n', '\n', text)
+        return text.strip()
+
+    def _chunk_text_for_api(self, text, model_name):
+        # Use simple splitting by paragraphs first if text is very long
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+        avg_para_len = sum(len(p) for p in paragraphs) / len(paragraphs) if paragraphs else 0
+
+        if "128k" in model_name:
+            chunk_size = 100000; overlap = 5000
+        else: # Assume ~4k context
+            chunk_size = 3500; overlap = 300
+
+        # If average paragraph is much smaller than chunk size, maybe just use paragraphs
+        if len(paragraphs) > 5 and avg_para_len < chunk_size * 0.5:
+            print(f"  Using paragraphs as chunks ({len(paragraphs)} paragraphs).")
+            return paragraphs
+
+        # Otherwise, use fixed size chunking
+        if len(text) <= chunk_size * 1.1: return [text] # No chunking needed for small texts
+
+        print(f"  Chunking text for {model_name} (size={chunk_size}, overlap={overlap})...")
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            chunks.append(text[start:end])
+            # Move start position forward by chunk size minus overlap
+            start += chunk_size - overlap
+            # Break if start is not advancing or has passed the end
+            if start >= end: break
+
+        # Ensure the very end is included if missed by overlap logic
+        if chunks and text.find(chunks[-1]) + len(chunks[-1]) < len(text) - 100: # Check if last chunk covers the end
+             # Add the last chunk_size characters as a final chunk
+             last_part_start = max(0, len(text) - chunk_size)
+             last_part = text[last_part_start:]
+             # Avoid adding duplicates if the last chunk is already the same
+             if not chunks or last_part != chunks[-1]:
+                 chunks.append(last_part)
+
+        print(f"  Created {len(chunks)} chunks.")
+        return [c.strip() for c in chunks if c.strip()]
+
+    def generate_graph(self, text, model="EmergentMethods/Phi-3-mini-4k-instruct-graph"):
+        if not self.client: print("API client not available."); return None
+        if not text or not text.strip(): print("❌ Skipping API call: Input text is empty."); return None
+
+        cleaned_text = self._clean_text_for_api(text)
+        print(f"📊 Calling Graph-Mind API with model: {model}...")
+        print(f"  Input text length: {len(cleaned_text)} characters.")
+
+        try:
+            # Check API endpoint if '/process_and_visualize' fails - use documented endpoint
+            # Check the Gradio Space documentation for the correct function name if this fails
+            result = self.client.predict(
+                text=cleaned_text,
+                model=model,
+                api_name="/process_and_visualize" # Verify this endpoint name on the Space page
+            )
+            print("✅ API call successful.")
+            # The result format depends on the API - adjust processing if needed
+            return result
+        except Exception as e:
+            print(f"❌ Error during Graph-Mind API call: {e}")
+            # You might want to check e.g., if it's a specific Gradio error
+            # or network issue here for more specific feedback.
+            return None
+
+    def generate_graph_from_document(self, document_text, model="EmergentMethods/Phi-3-mini-4k-instruct-graph", process_in_chunks=True):
+        if not self.client: print("API client not available."); return None
+        if not document_text or not document_text.strip(): print("❌ No document text provided."); return None
+
+        if process_in_chunks:
+            text_chunks = self._chunk_text_for_api(document_text, model)
+            if not text_chunks: print("❌ Text chunking failed."); return None
+
+            print(f"📊 Calling Graph-Mind API for {len(text_chunks)} chunks using {model}...")
+            all_results = []
+            start_time = time.time()
+
+            for i, chunk in enumerate(text_chunks):
+                print(f" Processing chunk {i+1}/{len(text_chunks)} ({len(chunk)} chars)...")
+                if not chunk or not chunk.strip(): print(f"  Skipping empty chunk {i+1}."); continue
+
+                chunk_start_time = time.time()
+                chunk_result = self.generate_graph(text=chunk, model=model)
+                chunk_end_time = time.time()
+                print(f"  Chunk {i+1} processing time: {chunk_end_time - chunk_start_time:.2f}s")
+
+                if chunk_result:
+                     all_results.append(chunk_result)
+                     print(f"✅ API processed chunk {i+1} successfully.")
+                     # Option: Process all chunks and merge? Or return first?
+                     # Current logic returns the first successful result.
+                     total_time = time.time() - start_time
+                     print(f"  Returning result from first successful chunk. Total time elapsed: {total_time:.2f}s")
+                     return chunk_result # Return the first good result
+                else:
+                    print(f"  ❌ Skipping chunk {i+1} due to error during API call.")
+                    # Optional: Add a delay before retrying or next chunk?
+                    if i < len(text_chunks) - 1: time.sleep(1) # Small delay
+
+            # If loop finishes without returning a result
+            total_time = time.time() - start_time
+            print(f"❌ No successful API results obtained from {len(text_chunks)} chunks. Total time: {total_time:.2f}s")
+            return None # No results from any chunk
+        else:
+             print("Processing entire document in one API call (may fail for large docs)...")
+             return self.generate_graph(document_text, model=model)
+
+    def display_results(self, results):
+        # The API returns a tuple: (html_graph, html_info, json_data, markdown_analysis)
+        if results is None: print("❌ No API results to display."); return
+        # Check if results is a tuple/list and has the expected number of elements
+        if not isinstance(results, (list, tuple)) or len(results) < 4:
+            print(f"❌ Unexpected API results format. Expected tuple/list of length 4.");
+            print(f"  Received ({type(results)}, length {len(results)}): {results}")
+            # Try to display parts if they exist, assuming the order
+            if isinstance(results, (list, tuple)) and len(results) > 0 and isinstance(results[0], str):
+                 print("\n📊 Attempting to display first element as HTML graph:")
+                 try: display(HTML(results[0]))
+                 except Exception as e: print(f"  Error displaying HTML graph: {e}")
+            return
+
+        # Unpack the results
+        html_graph, html_info, json_data, markdown_analysis = results[:4]
+
+        print("\n" + "="*15 + " Graph-Mind API Results " + "="*15)
+        if html_graph and isinstance(html_graph, str):
+            print("\n📊 KG Visualization (Interactive HTML from API):")
+            try: display(HTML(html_graph))
+            except Exception as e: print(f"  Error displaying HTML graph: {e}")
+        else: print("\n📊 KG Visualization (API): Not provided or empty.")
+
+        if html_info and isinstance(html_info, str):
+            print("\n📌 Additional Info (HTML from API):")
+            try: display(HTML(html_info))
+            except Exception as e: print(f"  Error displaying HTML info: {e}")
+        else: print("\n📌 Additional Info (API): Not provided or empty.")
+
+        if markdown_analysis and isinstance(markdown_analysis, str):
+            print("\n\n🔍 Analysis (Markdown from API):")
+            try: display(Markdown(markdown_analysis))
+            except Exception as e: print(f"  Error displaying Markdown analysis: {e}")
+        else: print("\n🔍 Analysis (API): Not provided or empty.")
+
+        if json_data: # Can be dict or list
+            print("\n\n🧩 Raw JSON Data (from API):")
+            try:
+                # Pretty print the JSON data
+                print(json.dumps(json_data, indent=2))
+            except Exception as e: print(f"  Error processing/displaying JSON data: {e}")
+        else: print("\n🧩 JSON Data (API): Not provided or empty.")
+        print("="*51)
+
+
+# --- ENHANCED Interactive Visualization Function ---
+print("Defining enhanced interactive KG visualization function (show_interactive_kg)...")
+
+def show_interactive_kg(G,
+                        output_filename="interactive_kg.html",
+                        output_dir=output_dir, # Use global output dir
+                        color_attribute='community', # 'community', 'topic', 'type', or None
+                        topic_palette=topic_colors, # Use global topic colors
+                        max_nodes_for_community=2000, # Limit community detection for performance
+                        filter_min_degree=1, # Show nodes with at least this degree
+                        max_nodes_to_display=None, # Limit display to top N nodes by degree
+                        physics_simulation=True, # Enable physics for layout
+                        title="Interactive Knowledge Graph"):
+    """
+    Generates and displays an interactive HTML visualization of the graph using pyvis.
+    Also saves the visualization to an HTML file. Uses robust saving and display methods.
+    Can optionally limit the number of nodes displayed to the top N by degree.
+    Includes adjusted physics parameters for calmer node movement.
+    v3.2.8: Reinforced string escaping within title attributes to prevent JSON errors.
+            Handles potential failure of community detection import gracefully.
+    """
+    if not isinstance(G, nx.Graph) or G.number_of_nodes() == 0:
+        print("❌ Cannot create interactive visualization: Graph is invalid or empty.")
+        return
+
+    print(f"\n📊 Generating Interactive Visualization: '{output_filename}'...")
+    print(f"   Coloring nodes by: {color_attribute if color_attribute else 'Default'}")
+    print(f"   Filtering nodes with degree < {filter_min_degree}")
+    if max_nodes_to_display is not None and isinstance(max_nodes_to_display, int) and max_nodes_to_display > 0:
+        print(f"   Limiting display to top {max_nodes_to_display} nodes by degree.")
+
+    # --- 1. Filter Graph ---
+    H = G.copy()
+    original_node_count = H.number_of_nodes()
+    print(f"  Initial graph: {original_node_count} nodes, {H.number_of_edges()} edges.")
+
+    # Step 1a: Filter by minimum degree
+    if filter_min_degree > 0 and H.number_of_nodes() > 0:
+        nodes_to_keep_degree = [n for n, d in H.degree() if d >= filter_min_degree]
+        if not nodes_to_keep_degree and original_node_count > 0:
+            print(f"  ⚠️ Warning: No nodes remain after filtering with min_degree={filter_min_degree}. Trying to proceed with original graph (may be empty).")
+        elif len(nodes_to_keep_degree) < original_node_count:
+            nodes_removed_degree = original_node_count - len(nodes_to_keep_degree)
+            H = H.subgraph(nodes_to_keep_degree).copy()
+            print(f"  Filtered by min_degree={filter_min_degree}: {H.number_of_nodes()} nodes remain (Removed {nodes_removed_degree}).")
+
+    # Step 1b: Filter by max_nodes_to_display
+    if H.number_of_nodes() > 0 and max_nodes_to_display is not None and isinstance(max_nodes_to_display, int) and max_nodes_to_display > 0:
+        if H.number_of_nodes() > max_nodes_to_display:
+            print(f"  Applying node limit: Selecting top {max_nodes_to_display} nodes by degree from remaining {H.number_of_nodes()} nodes...")
+            node_degrees_h = dict(H.degree())
+            sorted_nodes = sorted(node_degrees_h, key=node_degrees_h.get, reverse=True)
+            top_nodes = sorted_nodes[:max_nodes_to_display]
+            nodes_removed_limit = H.number_of_nodes() - len(top_nodes)
+            H = H.subgraph(top_nodes).copy()
+            print(f"  Filtered by max_nodes={max_nodes_to_display}: {H.number_of_nodes()} nodes remain (Removed {nodes_removed_limit} more).")
+        else:
+            print(f"  Node limit ({max_nodes_to_display}) not applied: Graph already has {H.number_of_nodes()} or fewer nodes after degree filtering.")
+    elif max_nodes_to_display is not None:
+         print(f"  Ignoring invalid max_nodes_to_display value: {max_nodes_to_display}. Showing all nodes passing degree filter.")
+
+    if H.number_of_nodes() == 0:
+         print("  ❌ Graph is empty after all filtering. Aborting visualization.")
+         return
+    else:
+         print(f"  Final graph for visualization: {H.number_of_nodes()} nodes, {H.number_of_edges()} edges.")
+
+
+    # --- 2. Determine Node Colors ---
+    node_colors = {}
+    communities = {}
+    default_color = ENTITY_TYPE_COLORS['DEFAULT']
+
+    if color_attribute == 'community':
+        # Check if the community_louvain module was imported successfully earlier
+        if not COMMUNITY_DETECTION_AVAILABLE:
+            print("  ⚠️ Skipping community detection: Library not loaded correctly.")
+            color_attribute = None # Fallback to default colors
+        elif H.number_of_nodes() <= max_nodes_for_community:
+            if H.number_of_edges() > 0 and H.number_of_nodes() > 1:
+                try:
+                    print(f"  Running community detection (Louvain) on {H.number_of_nodes()} nodes...")
+                    # Ensure we use the imported object, even if it's None (handled by COMMUNITY_DETECTION_AVAILABLE check)
+                    if community_louvain:
+                        communities = community_louvain.best_partition(H.to_undirected()) # *** THE CALL IS HERE ***
+                        num_communities = len(set(communities.values()))
+                        print(f"  Found {num_communities} communities.")
+                        comm_palette = plt.cm.get_cmap("tab20", max(20, num_communities))
+                        community_colors = {c: "#{:02x}{:02x}{:02x}".format(*[int(255*x) for x in comm_palette(c % 20)[:3]])
+                                            for c in set(communities.values())}
+                        node_colors = {n: community_colors.get(communities.get(n, -1), default_color) for n in H.nodes()}
+                    else:
+                         # This case should be caught by COMMUNITY_DETECTION_AVAILABLE, but as safety:
+                         print("  ⚠️ Internal Warning: community_louvain object is None despite flag. Skipping.")
+                         color_attribute = None
+                except AttributeError as ae: # Catch the specific error if best_partition is missing
+                    print(f"  ❌ Community detection failed: {type(ae).__name__}: {ae}.")
+                    print("     (This usually means the 'python-louvain' library is not correctly installed or the runtime wasn't restarted after install).")
+                    print("     Falling back to default colors.")
+                    color_attribute = None
+                except Exception as e: # Catch other potential errors during detection
+                    print(f"  ⚠️ Community detection failed unexpectedly: {type(e).__name__}: {e}. Using default colors.")
+                    color_attribute = None
+            else:
+                 print("  Skipping community detection: No edges or insufficient nodes in filtered graph.")
+                 color_attribute = None
+        else:
+            print(f"  Skipping community detection: Graph too large ({H.number_of_nodes()} > {max_nodes_for_community}).")
+            color_attribute = None
+
+    # --- Color by Topic / Type / Default (No changes needed here) ---
+    if color_attribute == 'topic':
+        print(f"  Assigning colors based on 'topic' attribute...")
+        has_topic_info = False
+        for node, data in H.nodes(data=True):
+            topic_idx = data.get('topic')
+            if isinstance(topic_idx, int) and topic_idx >= 0:
+                node_colors[node] = topic_palette[topic_idx % len(topic_palette)]
+                has_topic_info = True
+            else:
+                node_colors[node] = default_color
+        if not has_topic_info and H.number_of_nodes() > 0:
+            print("  ⚠️ No nodes found with 'topic' attribute in the filtered graph. Using default colors.")
+            color_attribute = None # Ensure fallback if coloring failed
+
+    elif color_attribute == 'type':
+        print(f"  Assigning colors based on 'type' attribute...")
+        has_type_info = False
+        for node, data in H.nodes(data=True):
+            entity_type = data.get('type')
+            node_colors[node] = ENTITY_TYPE_COLORS.get(entity_type, default_color)
+            if entity_type and node_colors[node] != default_color:
+                 has_type_info = True
+        if not has_type_info and H.number_of_nodes() > 0:
+             print("  ⚠️ No nodes found with specific 'type' attribute in the filtered graph. Using default colors.")
+             color_attribute = None # Ensure fallback if coloring failed
+
+    # Final fallback if no valid coloring was assigned
+    if color_attribute is None or not node_colors or all(c == default_color for c in node_colors.values()):
+         if H.number_of_nodes() > 0: print("  Assigning default color to all nodes.")
+         node_colors = {n: default_color for n in H.nodes()}
+
+
+    # --- 3. Initialize Pyvis Network ---
+    net = Network(height='800px', width='100%', bgcolor='#f8f8f8',
+                  font_color='#333333', heading=title, directed=H.is_directed())
+
+    # --- 4. Configure Physics ---
+    if physics_simulation:
+        net.force_atlas_2based()
+        print("  Physics simulation enabled (detailed settings in Step 7).")
+    else:
+        # Still call force_atlas_2based for initial placement even if physics disabled later
+        net.force_atlas_2based()
+        net.physics_enabled = False
+        print("  Physics simulation disabled.")
+
+
+    # --- 5. Add Nodes ---
+    node_degrees_H = dict(H.degree())
+    max_deg_H = max(node_degrees_H.values()) if node_degrees_H else 1
+    if max_deg_H == 0: max_deg_H = 1
+
+    for node, data in H.nodes(data=True):
+        node_id = str(node)
+        # Truncate label early, then escape
+        label_raw = data.get('label', node_id)
+        label_truncated = label_raw[:80] if isinstance(label_raw, str) else str(label_raw)[:80]
+        label = escape_js_string(label_truncated)
+
+        node_degree_H = node_degrees_H.get(node, 0)
+        original_degree = G.degree(node) if node in G else node_degree_H
+        node_size = 8 + 18 * (np.log1p(node_degree_H) / np.log1p(max_deg_H))
+
+        # Build title string robustly, escaping each part
+        title_parts = []
+        title_parts.append(f"ID: {escape_js_string(node_id)}")
+        title_parts.append(f"Label: {label}") # Already escaped and truncated
+        title_parts.append(f"Degree (Displayed): {node_degree_H}")
+        title_parts.append(f"Degree (Original): {original_degree}")
+        node_type = data.get('type')
+        if node_type:
+            title_parts.append(f"Type: {escape_js_string(node_type)}")
+        topic_idx = data.get('topic')
+        if isinstance(topic_idx, int):
+            title_parts.append(f"Topic: T{topic_idx + 1}")
+        # Only add community info if communities were successfully computed
+        if color_attribute == 'community' and 'community' in communities and node in communities:
+             try: # Ensure community id is stringifiable
+                 comm_id_str = str(communities[node])
+                 title_parts.append(f"Community: {escape_js_string(comm_id_str)}")
+             except Exception: pass # Ignore if community id causes error
+
+        # Join parts with JavaScript newline sequence
+        title_text = "\\n".join(title_parts)
+
+        net.add_node(node_id,
+                     label=label,
+                     title=title_text, # Use the carefully constructed title
+                     color=node_colors.get(node, default_color),
+                     size=node_size,
+                     shape='dot'
+                     )
+
+    # --- 6. Add Edges ---
+    for u, v, data in H.edges(data=True):
+        source_id, target_id = str(u), str(v)
+
+        # Get raw labels for tooltip construction
+        label_u_raw = H.nodes[u].get('label', u)
+        label_v_raw = H.nodes[v].get('label', v)
+        # Escape them for the title
+        label_u_escaped = escape_js_string(label_u_raw)
+        label_v_escaped = escape_js_string(label_v_raw)
+
+        # Truncate relation early, then escape
+        relation_raw = data.get('relation', '')
+        relation_truncated = relation_raw[:100] if isinstance(relation_raw, str) else str(relation_raw)[:100]
+        relation = escape_js_string(relation_truncated)
+
+        weight = data.get('weight', 1)
+
+        # Build edge title string robustly
+        if relation:
+            title_rel = f"'{label_u_escaped}' -> '{label_v_escaped}'\\nRel: {relation}\\n(Weight: {weight})"
+        else:
+            title_rel = f"'{label_u_escaped}' -> '{label_v_escaped}'\\n(Weight: {weight})"
+
+        net.add_edge(source_id, target_id,
+                     title=title_rel, # Use the carefully constructed title
+                     value=weight,
+                     width=1 + np.log1p(weight) / 2,
+                     color='#cccccc'
+                     )
+
+    # --- 7. Add Options (with Calmer Physics) ---
+    physics_enabled_js = str(physics_simulation).lower()
+    arrows_enabled_js = str(H.is_directed()).lower()
+
+    grav_const = -25000
+    central_grav = 0.05
+    spring_len = 120
+    spring_const = 0.05
+    damping_factor = 0.85
+    stabilization_iter = 1500
+
+    print(f"  Applying physics settings: Damping={damping_factor}, GravConst={grav_const}, StabilizeIter={stabilization_iter}")
+
+    net.set_options(f"""
+    var options = {{
+      "nodes": {{
+        "font": {{
+          "size": 12,
+          "face": "Tahoma"
+        }}
+      }},
+      "edges": {{
+        "smooth": {{
+           "type": "continuous",
+           "forceDirection": "none",
+           "roundness": 0.2
+        }},
+        "arrows": {{
+          "to": {{ "enabled": {arrows_enabled_js}, "scaleFactor": 0.7 }}
+        }},
+        "color": {{
+           "inherit": false
+        }}
+      }},
+      "interaction": {{
+        "hover": true,
+        "tooltipDelay": 200,
+        "hideEdgesOnDrag": true,
+        "multiselect": true
+      }},
+      "physics": {{
+        "enabled": {physics_enabled_js},
+        "forceAtlas2Based": {{
+          "gravitationalConstant": {grav_const},
+          "centralGravity": {central_grav},
+          "springLength": {spring_len},
+          "springConstant": {spring_const},
+          "damping": {damping_factor},
+          "avoidOverlap": 0.5
+        }},
+        "solver": "forceAtlas2Based",
+        "stabilization": {{
+           "enabled": true,
+           "iterations": {stabilization_iter},
+           "updateInterval": 50,
+           "onlyDynamicEdges": false,
+           "fit": true
+        }}
+      }}
+    }}
+    """)
+    # net.show_buttons(filter_=['physics']) # Optionally show physics toggle button
+
+    # --- 8. Save AND Show ---
+    os.makedirs(output_dir, exist_ok=True)
+    html_path = os.path.join(output_dir, output_filename)
+    try:
+        net.save_graph(html_path)
+        print(f"✅ Interactive graph saved to: {html_path}")
+        print(f"   Attempting to display '{output_filename}' directly below...")
+        display(HTML(filename=html_path))
+    except Exception as e_show:
+        # Print a more detailed error message including the type
+        print(f"❌ Error saving or displaying interactive graph '{output_filename}': {type(e_show).__name__}: {e_show}")
+        if os.path.exists(html_path):
+            relative_path_for_link = html_path
+            if relative_path_for_link.startswith('/content/'):
+                relative_path_for_link = relative_path_for_link[len('/content/'):]
+            display(HTML(f'<p>Display failed, but graph might be saved. <a href="{relative_path_for_link}" target="_blank">Click here to try opening {output_filename}</a></p>'))
+
+
+print("Knowledge Graph helper functions defined.")
+print("-" * 30, "\n")
+
+# ==============================================================================
+# ================= KNOWLEDGE GRAPH EXECUTION FLOW STARTS HERE =================
+# ==============================================================================
+
+# Initialize KG variables
+knowledge_graph_nx = None
+all_entities_nx = []
+all_relations_nx = []
+
+### --- Step 9: Extract Entities (NetworkX KG) --- ###
+print("--- Section 9: Extracting Entities for NetworkX KG ---")
+if 'pdf_contents_cleaned_kg' not in locals() or not pdf_contents_cleaned_kg:
+    print("❌ Cannot extract entities: Cleaned text ('pdf_contents_cleaned_kg') is missing from Section 4.")
+elif nlp is None:
+     print("❌ Cannot extract entities: spaCy model ('nlp') failed to load in Section 1/2.")
+else:
+    start_time_ent = time.time()
+    all_entities_nx = [] # Ensure it's empty before starting
+    for filename, text in pdf_contents_cleaned_kg.items():
+        ents = extract_entities_kg(text, filename=filename, spacy_nlp_model=nlp)
+        all_entities_nx.extend(ents) # Add entities from this file
+    end_time_ent = time.time()
+    print(f"Entity extraction completed in {end_time_ent - start_time_ent:.2f} seconds.")
+
+    if all_entities_nx:
+        # Remove potential duplicates across files before saving
+        unique_entities_for_saving = list({e['text'].lower(): e for e in all_entities_nx}.values())
+        entities_filepath = os.path.join(output_dir, 'entities_nx.json')
+        try:
+             with open(entities_filepath, 'w', encoding='utf-8') as f:
+                 json.dump(unique_entities_for_saving, f, ensure_ascii=False, indent=2)
+             print(f"✅ NetworkX entities ({len(unique_entities_for_saving)} unique) extracted and saved to {entities_filepath}")
+        except Exception as e_save_ent: print(f"⚠️ Error saving entities: {e_save_ent}")
+    else: print("⚠️ No entities passed filtering criteria.")
+print("-" * 30, "\n")
+
+
+### --- Step 10: Extract Relations (NetworkX KG) --- ###
+print("--- Section 10: Extracting Relations for NetworkX KG ---")
+if 'document_sentences' not in locals() or not document_sentences:
+     print("❌ Cannot extract relations: Sentences ('document_sentences') are missing from Section 4.")
+elif not all_entities_nx: # Check if entities were extracted in Step 9
+     print("❌ Cannot extract relations: No entities were extracted in Step 9.")
+else:
+    start_time_rel = time.time()
+    # Use unique entities (based on lowercase text) for relation extraction lookup
+    unique_entities_dict = {e['text'].lower(): e for e in all_entities_nx}
+    unique_entities_list_for_rel = list(unique_entities_dict.values())
+    all_relations_nx = [] # Ensure it's empty before starting
+
+    if not unique_entities_list_for_rel:
+         print("⚠️ No unique entities found after processing Step 9. Cannot extract relations.")
+    else:
+        print(f"Using {len(unique_entities_list_for_rel)} unique entities for relation extraction.")
+        for filename, sentences in document_sentences.items():
+            if isinstance(sentences, list) and all(isinstance(s, str) for s in sentences):
+                 rels = extract_relations_kg(sentences, unique_entities_list_for_rel, filename=filename)
+                 all_relations_nx.extend(rels) # Add relations from this file
+            else: print(f"⚠️ Skipping relation extraction for {filename}: 'sentences' data is not a list of strings.")
+
+        end_time_rel = time.time()
+        print(f"Relation extraction completed in {end_time_rel - start_time_rel:.2f} seconds.")
+
+        if all_relations_nx:
+            relations_filepath = os.path.join(output_dir, 'relations_nx.json')
+            try:
+                 # Save the list of relation dictionaries
+                 with open(relations_filepath, 'w', encoding='utf-8') as f:
+                     json.dump(all_relations_nx, f, ensure_ascii=False, indent=2)
+                 print(f"✅ NetworkX relations ({len(all_relations_nx)} instances) extracted and saved to {relations_filepath}")
+            except Exception as e_save_rel: print(f"⚠️ Error saving relations: {e_save_rel}")
+        else: print("⚠️ No relations were extracted based on co-occurrence criteria.")
+print("-" * 30, "\n")
+
+
+### --- Step 11: Build & Visualize NetworkX Knowledge Graph --- ###
+print("--- Section 11: Building & Visualizing Base NetworkX Knowledge Graph ---")
+if not all_entities_nx: # Check again if entities exist before building
+    print("❌ Cannot build NetworkX graph: No entities extracted in Step 9.")
+else:
+    start_time_build = time.time()
+    unique_entities_list_for_build = list({e['text'].lower(): e for e in all_entities_nx}.values())
+    knowledge_graph_nx = build_knowledge_graph_kg(unique_entities_list_for_build, all_relations_nx)
+    end_time_build = time.time()
+    print(f"Graph construction completed in {end_time_build - start_time_build:.2f} seconds.")
+
+    if knowledge_graph_nx is not None and knowledge_graph_nx.number_of_nodes() > 0:
+        # --- Save Graph Data ---
+        graphml_filepath = os.path.join(output_dir, "knowledge_graph_nx.graphml")
+        try:
+            # Ensure data types are primitive for GraphML export
+            G_copy = knowledge_graph_nx.copy()
+            for _, data in G_copy.nodes(data=True):
+                 for k, v in list(data.items()): # Use list() for safe iteration while modifying
+                     if not isinstance(v, (str, int, float, bool)): data[k] = str(v)
+            for _, _, data in G_copy.edges(data=True):
+                 for k, v in list(data.items()):
+                     if not isinstance(v, (str, int, float, bool)): data[k] = str(v)
+            nx.write_graphml(G_copy, graphml_filepath)
+            print(f"✅ NetworkX graph saved to {graphml_filepath} (for Gephi/Cytoscape)")
+        except Exception as e_graphml: print(f"⚠️ Error saving as GraphML: {e_graphml}.")
+
+        # --- Generate & Save Node Summary ---
+        summary_filepath = os.path.join(output_dir, 'entity_summary_nx.csv')
+        try:
+            if knowledge_graph_nx.number_of_nodes() > 0:
+                degrees = dict(knowledge_graph_nx.degree())
+                entity_summary = [{'NodeID': n,
+                                   'Label': data.get('label', n),
+                                   'Type': data.get('type', 'Unknown'),
+                                   'Connections (Degree)': degrees.get(n, 0)}
+                                  for n, data in knowledge_graph_nx.nodes(data=True)]
+                entity_df = pd.DataFrame(entity_summary).sort_values('Connections (Degree)', ascending=False)
+                if not entity_df.empty:
+                    entity_df.to_csv(summary_filepath, index=False, encoding='utf-8')
+                    print(f"✅ NetworkX entity summary saved to {summary_filepath}")
+                    print("\nTop Entities by Connections:")
+                    pd.set_option('display.max_columns', 5)
+                    pd.set_option('display.width', 120)
+                    print(entity_df.head(15).to_string(index=False))
+                    pd.reset_option('display.max_columns')
+                    pd.reset_option('display.width')
+                else: print("⚠️ Entity summary DataFrame is empty.")
+            else: print("⚠️ Graph has no nodes, skipping entity summary.")
+        except Exception as e_summary: print(f"⚠️ Could not generate/save entity summary: {e_summary}")
+
+
+        # --- Visualize INTERACTIVE Graphs (Displayed Inline & Saved) ---
+        # <<< Configure MAX_NODES_TO_DISPLAY here >>>
+        MAX_NODES_TO_DISPLAY = 50 # Example: Limit to top 250 nodes by degree
+        # MAX_NODES_TO_DISPLAY = None # Example: Show all nodes passing min_degree filter
+
+        title_suffix = f"(Top {MAX_NODES_TO_DISPLAY} Nodes by Degree)" if MAX_NODES_TO_DISPLAY is not None and isinstance(MAX_NODES_TO_DISPLAY, int) and MAX_NODES_TO_DISPLAY > 0 else "(Filtered by Min Degree)"
+
+        print("\nVisualizing interactive NetworkX graphs...")
+        show_interactive_kg(knowledge_graph_nx,
+                            output_filename="knowledge_graph_interactive_by_type.html",
+                            output_dir=output_dir,
+                            color_attribute='type',
+                            filter_min_degree=2, # Nodes must connect to at least 2 others
+                            max_nodes_to_display=MAX_NODES_TO_DISPLAY,
+                            title=f"Interactive Knowledge Graph (Colored by Entity Type) {title_suffix}")
+
+        show_interactive_kg(knowledge_graph_nx,
+                            output_filename="knowledge_graph_interactive_by_community.html",
+                            output_dir=output_dir,
+                            color_attribute='community', # Will attempt community detection
+                            filter_min_degree=2,
+                            max_nodes_to_display=MAX_NODES_TO_DISPLAY,
+                            title=f"Interactive Knowledge Graph (Colored by Community) {title_suffix}")
+    else:
+        print("❌ NetworkX graph is empty or invalid. Skipping save, summary, and visualization.")
+
+print("-" * 30, "\n")
+
+
+### --- Step 12: Integrate Topics with NetworkX Graph --- ###
+print("--- Section 12: Integrating LDA Topics with NetworkX Graph ---")
+
+actual_lda_topics = 0
+if 'lda' in locals() and lda is not None:
+    try: actual_lda_topics = lda.n_components
+    except AttributeError: actual_lda_topics = 0
+
+can_integrate_topics = (
+    isinstance(knowledge_graph_nx, nx.Graph) and knowledge_graph_nx.number_of_nodes() > 0 and
+    'lda' in locals() and lda is not None and
+    'vectorizer' in locals() and vectorizer is not None and
+    (('document_sentences' in locals() and document_sentences) or ('all_relations_nx' in locals() and all_relations_nx)) and
+    actual_lda_topics > 0
+)
+
+if can_integrate_topics:
+    print(f"Attempting topic integration using {actual_lda_topics} topics...")
+    start_time_topic_int = time.time()
+    topic_integration_success = assign_topics_to_entities_kg(
+        knowledge_graph_nx, lda, vectorizer, document_sentences, all_relations_nx
+    )
+    end_time_topic_int = time.time()
+    print(f"Topic assignment process completed in {end_time_topic_int - start_time_topic_int:.2f} seconds.")
+
+    if topic_integration_success:
+        print("✅ Topics assigned to entities.")
+
+        # --- Visualize INTERACTIVE Topic-Aware Graph ---
+        print("\nVisualizing topic-aware interactive NetworkX graph...")
+        # <<< Use the same MAX_NODES_TO_DISPLAY limit and title suffix here >>>
+        # (Assumes MAX_NODES_TO_DISPLAY and title_suffix are defined in Step 11)
+        show_interactive_kg(knowledge_graph_nx,
+                            output_filename="knowledge_graph_interactive_by_topic.html",
+                            output_dir=output_dir,
+                            color_attribute='topic', # Color by assigned topic
+                            topic_palette=topic_colors,
+                            filter_min_degree=2,
+                            max_nodes_to_display=MAX_NODES_TO_DISPLAY,
+                            title=f"Interactive Knowledge Graph (Colored by Topic) {title_suffix}")
+
+        # --- Save Updated Graph with Topic Info ---
+        graphml_topic_filepath = os.path.join(output_dir, "knowledge_graph_nx_topics.graphml")
+        try:
+            G_topic_copy = knowledge_graph_nx.copy()
+            # Ensure data types are primitive for GraphML export
+            for _, data in G_topic_copy.nodes(data=True):
+                 for k, v in list(data.items()):
+                     if not isinstance(v, (str, int, float, bool)): data[k] = str(v)
+            for _, _, data in G_topic_copy.edges(data=True):
+                 for k, v in list(data.items()):
+                     if not isinstance(v, (str, int, float, bool)): data[k] = str(v)
+            nx.write_graphml(G_topic_copy, graphml_topic_filepath)
+            print(f"✅ Topic-aware NetworkX graph saved to {graphml_topic_filepath}")
+        except Exception as e_gml_topic: print(f"⚠️ Failed to save topic-aware graph: {e_gml_topic}")
+
+        # --- Generate Topic-Aware Summary Table ---
+        topic_summary_filepath = os.path.join(output_dir, 'entity_topic_summary_nx.csv')
+        try:
+            if knowledge_graph_nx.number_of_nodes() > 0:
+                degrees = dict(knowledge_graph_nx.degree())
+                entity_topic_summary = []
+                for n, data in knowledge_graph_nx.nodes(data=True):
+                     topic_val = data.get('topic')
+                     topic_display = f"T{topic_val + 1}" if isinstance(topic_val, int) else 'N/A'
+                     entity_topic_summary.append({
+                         'NodeID': n,
+                         'Label': data.get('label', n),
+                         'Type': data.get('type', 'Unknown'),
+                         'Connections (Degree)': degrees.get(n, 0),
+                         'AssignedTopic': topic_display
+                     })
+                entity_topic_df = pd.DataFrame(entity_topic_summary).sort_values(['Connections (Degree)', 'NodeID'], ascending=[False, True])
+                if not entity_topic_df.empty:
+                    entity_topic_df.to_csv(topic_summary_filepath, index=False, encoding='utf-8')
+                    print(f"✅ NetworkX entity topic summary saved to {topic_summary_filepath}")
+                    print("\nTop Entities by Connections (with Topics):")
+                    pd.set_option('display.max_columns', 6)
+                    pd.set_option('display.width', 140)
+                    print(entity_topic_df.head(15).to_string(index=False))
+                    pd.reset_option('display.max_columns')
+                    pd.reset_option('display.width')
+                else: print("⚠️ Entity topic summary DataFrame is empty.")
+            else: print("⚠️ Graph has no nodes, skipping topic summary.")
+        except Exception as e_tsummary: print(f"⚠️ Could not generate/save entity topic summary: {e_tsummary}")
+    else:
+        print("⚠️ Topic integration ran, but failed to assign topics successfully. Check context data and logs.")
+else:
+    print("\nSkipping topic integration: One or more prerequisites not met.")
+    if not isinstance(knowledge_graph_nx, nx.Graph) or knowledge_graph_nx.number_of_nodes() == 0: print("  Reason: NetworkX graph is missing or empty.")
+    if 'lda' not in locals() or lda is None: print("  Reason: LDA model is missing.")
+    if 'vectorizer' not in locals() or vectorizer is None: print("  Reason: Vectorizer is missing.")
+    if not (('document_sentences' in locals() and document_sentences) or ('all_relations_nx' in locals() and all_relations_nx)): print("  Reason: Context (sentences/relations) is missing.")
+    if actual_lda_topics <= 0: print("  Reason: LDA model has no topics or failed.")
+
+print("-" * 30, "\n")
+
+
+### --- Step 13: Graph-Mind API Knowledge Graph (Optional) --- ###
+print("--- Section 13: Generating Knowledge Graph with Graph-Mind API (Optional) ---")
+
+run_graph_mind = False # Default to False
+
+if not GRADIO_AVAILABLE:
+    print("❌ Graph-Mind API skipped: gradio_client library not available (install if needed).")
+elif 'pdf_contents_cleaned_kg' not in locals() or not pdf_contents_cleaned_kg: # Use cleaned KG text
+    print("❌ Graph-Mind API skipped: No cleaned document content found from Section 4.")
+else:
+    print("\nThis optional step uses the external Graph-Mind API via Gradio Client.")
+    print("It sends document text (potentially cleaned/chunked) to an external service.")
+    print("Ensure you are comfortable with sending your data externally.")
+    try:
+        # Attempt to get user input, default to 'no' in non-interactive environments
+        user_choice = input("Do you want to run the Graph-Mind API analysis? (yes/no) [default: no]: ").lower().strip()
+        if user_choice in ['yes', 'y']:
+            run_graph_mind = True
+        else:
+            print("Skipping Graph-Mind API analysis.")
+    except EOFError: # Handles running in non-interactive environments like automated scripts
+         print("\nInput not available (non-interactive environment?). Skipping Graph-Mind API analysis by default.")
+         run_graph_mind = False
+    except Exception as e_input:
+         print(f"\nError reading input: {e_input}. Skipping Graph-Mind API analysis by default.")
+         run_graph_mind = False
+
+
+if run_graph_mind:
+    api_builder = KnowledgeGraphBuilderAPI(use_gradio=True)
+
+    if not api_builder.client:
+        print("❌ Cannot proceed with Graph-Mind: API Client connection failed.")
+    else:
+        print("\nPreparing text for Graph-Mind API...")
+        # Combine cleaned texts from all documents for the API call
+        all_text_for_api = "\n\n--- End of Document ---\n\n".join(pdf_contents_cleaned_kg.values())
+        print(f"Total text length for API: {len(all_text_for_api):,} characters.")
+
+        if not all_text_for_api.strip():
+            print("❌ No text content available for API after preparation.")
+        else:
+            print("\nChoose Graph-Mind model to use:")
+            print("  1. Phi-3-mini-4k (Default, faster, smaller context)")
+            print("  2. Phi-3-mini-128k (Slower, larger context)")
+            model_choice_api = "1" # Default
+            try:
+                 model_choice_input = input("Enter choice (1 or 2) [default: 1]: ").strip()
+                 if model_choice_input == "2":
+                     model_choice_api = "2"
+                 else:
+                     print("Using default model (1).") # Explicitly state default usage
+            except EOFError:
+                 print("Input unavailable, using default model (1).")
+            except Exception as e_input_model:
+                 print(f"Error reading model choice: {e_input_model}. Using default model (1).")
+
+
+            if model_choice_api == "2":
+                api_model = "EmergentMethods/Phi-3-mini-128k-instruct-graph"
+                process_chunks = True
+            else:
+                api_model = "EmergentMethods/Phi-3-mini-4k-instruct-graph"
+                process_chunks = True # Still beneficial to chunk for 4k model with multiple docs
+
+            print(f"Selected API model: {api_model}")
+            print(f"Processing in chunks: {process_chunks}")
+
+
+            api_results = api_builder.generate_graph_from_document(
+                document_text=all_text_for_api,
+                model=api_model,
+                process_in_chunks=process_chunks
+            )
+
+            if api_results is not None:
+                api_builder.display_results(api_results)
+                print("\n✅ Graph-Mind API analysis complete!")
+            else:
+                print("\n❌ Graph-Mind API did not return results or failed.")
+else:
+    # Provide feedback if skipped due to conditions other than user choice/default
+    if GRADIO_AVAILABLE and ('pdf_contents_cleaned_kg' in locals() and pdf_contents_cleaned_kg) and run_graph_mind is False:
+         print("Graph-Mind API section was skipped by user choice or default.")
+
+print("-" * 30, "\n")
+
+
+### --- Section 14: Final Summary --- ###
+print("--- Section 14: Script Execution Complete ---")
+print("\n" + "="*60)
+print("✅✅✅ Full Topic Modeling and Knowledge Graph Analysis Finished ✅✅✅")
+print(f"\nAll generated files (models, data, summaries, graphs) are saved in:")
+print(f"➡️ {output_dir}")
+
+print("\nKey Outputs:")
+print("  - CSV Summaries: 'topic_keywords.csv', 'entity_summary_nx.csv', 'entity_topic_summary_nx.csv'")
+print("  - LDA Model/Vectorizer: 'lda_model.pkl', 'vectorizer.pkl'")
+print("  - Graph Data: 'knowledge_graph_nx.graphml', 'knowledge_graph_nx_topics.graphml' (Open these in Gephi/Cytoscape)")
+print("  - INTERACTIVE Visualizations: '.html' files (Saved and displayed in output cells above)")
+print("     - knowledge_graph_interactive_by_type.html")
+print("     - knowledge_graph_interactive_by_community.html (Check if community detection succeeded)")
+print("     - knowledge_graph_interactive_by_topic.html (if topics assigned)")
+print("  - Static Plots: '.png' files (Word clouds, topic prevalence, etc.)")
+if run_graph_mind:
+    print("  - Graph-Mind API Outputs (if run): See Section 13 output for details (HTML/JSON).")
+
+print("\nRecommendations:")
+print("  - ✨ Explore the interactive graphs displayed directly in the Colab/Jupyter output cells above.")
+print("     (You may need to scroll up to see them). Check the console logs during generation for warnings (e.g., about community detection).")
+print("  - You can also open the saved '.html' files from the file browser (left panel, navigate to 'results').")
+print("  - For deep analysis and publication-quality layouts, import '.graphml' files into Gephi or Cytoscape.")
+print("  - Review the '.csv' files for topic keywords and entity summaries.")
+print("  - Adjust `NUMBER_OF_TOPICS` (Section 5) or `MAX_NODES_TO_DISPLAY` (Section 11) and re-run if needed.")
+print("  - If community detection failed, ensure you followed the instruction to RESTART THE RUNTIME after Section 1.")
+print("="*60)
+
+# Optional: List generated files
+print("\nGenerated files in results directory:")
+try:
+    # Use Pathlib for cleaner listing if preferred, but !ls is fine in Colab/Linux
+    # file_list = [f.name for f in Path(output_dir).iterdir() if f.is_file()]
+    # print("\n".join(file_list))
+    !ls -lh {output_dir}
+except Exception as e_ls:
+    print(f"Could not list files in {output_dir}: {e_ls}")

@@ -1,0 +1,329 @@
+# Bibliometric Data Processor for Google Colab
+# This script reads Web of Science and Scopus data, removes duplicates, and prepares a merged dataset
+
+# Install required packages
+!pip install pandas numpy plotly
+
+import pandas as pd
+import numpy as np
+import re
+import json
+from pathlib import Path
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from google.colab import files
+import io
+
+# Upload files
+print("Please upload your Web of Science CSV file (savedrecs1.csv)")
+wos_uploaded = files.upload()
+wos_file = next(iter(wos_uploaded.keys()))
+
+print("\nPlease upload your Scopus CSV file (scopus1.csv)")
+scopus_uploaded = files.upload()
+scopus_file = next(iter(scopus_uploaded.keys()))
+
+# Read the files
+print("\nReading files...")
+wos_df = pd.read_csv(wos_file, low_memory=False)
+scopus_df = pd.read_csv(scopus_file, low_memory=False)
+
+print(f"Web of Science records: {len(wos_df)}")
+print(f"Scopus records: {len(scopus_df)}")
+
+# Standardize data structure
+print("\nStandardizing data structures...")
+
+def normalize_title(title):
+    """Normalize title for comparison"""
+    if pd.isna(title):
+        return ''
+    return re.sub(r'[^\w\s]', '', str(title).lower()).strip()
+
+def standardize_wos_record(record):
+    """Standardize Web of Science record"""
+    return {
+        'title': record.get('Article Title', ''),
+        'doi': str(record.get('DOI', '')).lower().strip() if pd.notna(record.get('DOI')) else '',
+        'authors': record.get('Authors', ''),
+        'year': record.get('Publication Year'),
+        'source': 'WoS',
+        'original_record': record
+    }
+
+def standardize_scopus_record(record):
+    """Standardize Scopus record"""
+    return {
+        'title': record.get('Title', ''),
+        'doi': str(record.get('DOI', '')).lower().strip() if pd.notna(record.get('DOI')) else '',
+        'authors': record.get('Authors', ''),
+        'year': record.get('Year'),
+        'source': 'Scopus',
+        'original_record': record
+    }
+
+# Convert to standardized format
+wos_records = [standardize_wos_record(record) for _, record in wos_df.iterrows()]
+scopus_records = [standardize_scopus_record(record) for _, record in scopus_df.iterrows()]
+
+# Deduplicate by DOI
+print("\nIdentifying duplicates by DOI...")
+records_by_doi = {}
+records_by_title = {}
+
+for record in wos_records + scopus_records:
+    if record['doi']:
+        if record['doi'] not in records_by_doi:
+            records_by_doi[record['doi']] = []
+        records_by_doi[record['doi']].append(record)
+    else:
+        normalized_title = normalize_title(record['title'])
+        if normalized_title not in records_by_title:
+            records_by_title[normalized_title] = []
+        records_by_title[normalized_title].append(record)
+
+print(f"Records with DOI: {len(records_by_doi)}")
+print(f"Records without DOI: {len(records_by_title)}")
+
+# Count duplicates
+doi_duplicates = sum(1 for records in records_by_doi.values() if len(records) > 1)
+title_duplicates = sum(1 for records in records_by_title.values() if len(records) > 1)
+print(f"DOI-based duplicates: {doi_duplicates}")
+print(f"Title-based duplicates: {title_duplicates}")
+
+def merge_records(records):
+    """Merge duplicate records"""
+    wos_record = next((r for r in records if r['source'] == 'WoS'), None)
+    scopus_record = next((r for r in records if r['source'] == 'Scopus'), None)
+    
+    if wos_record and scopus_record:
+        merged = wos_record.copy()
+        merged['scopus_cited_by'] = scopus_record['original_record'].get('Cited by', 0)
+        merged['scopus_id'] = scopus_record['original_record'].get('EID', '')
+        
+        wos_citations = wos_record['original_record'].get('Times Cited, WoS Core', 0) or 0
+        scopus_citations = scopus_record['original_record'].get('Cited by', 0) or 0
+        merged['cited_by'] = wos_citations + scopus_citations
+        
+        merged['sources'] = ['WoS', 'Scopus']
+        merged['both_records'] = {
+            'wos': wos_record['original_record'],
+            'scopus': scopus_record['original_record']
+        }
+        return merged
+    else:
+        record = records[0]
+        record['sources'] = [record['source']]
+        if record['source'] == 'WoS':
+            record['cited_by'] = record['original_record'].get('Times Cited, WoS Core', 0) or 0
+        else:
+            record['cited_by'] = record['original_record'].get('Cited by', 0) or 0
+        return record
+
+# Merge duplicate records
+print("\nMerging duplicate records...")
+merged_records = []
+
+for records in records_by_doi.values():
+    merged_records.append(merge_records(records))
+
+for records in records_by_title.values():
+    merged_records.append(merge_records(records))
+
+print(f"Merged records: {len(merged_records)}")
+print(f"Duplicates removed: {len(wos_df) + len(scopus_df) - len(merged_records)}")
+
+# Prepare standardized data for bibliometric analysis
+print("\nPreparing data for bibliometric analysis...")
+
+bibliometric_data = []
+for record in merged_records:
+    # Convert original_record to dict if it's a Series
+    if hasattr(record['original_record'], 'to_dict'):
+        record['original_record'] = record['original_record'].to_dict()
+    
+    wos_rec = record.get('both_records', {}).get('wos') if 'both_records' in record else (
+        record['original_record'] if record['source'] == 'WoS' else None
+    )
+    scopus_rec = record.get('both_records', {}).get('scopus') if 'both_records' in record else (
+        record['original_record'] if record['source'] == 'Scopus' else None
+    )
+    
+    # Convert to dict if they're Series objects
+    if wos_rec is not None and hasattr(wos_rec, 'to_dict'):
+        wos_rec = wos_rec.to_dict()
+    if scopus_rec is not None and hasattr(scopus_rec, 'to_dict'):
+        scopus_rec = scopus_rec.to_dict()
+    
+    prepared_record = {
+        'ID': record['doi'] or (wos_rec.get('UT (Unique WOS ID)') if wos_rec else '') or 
+              (scopus_rec.get('EID') if scopus_rec else '') or f'record_{np.random.randint(1000000)}',
+        'TI': record['title'],
+        'AU': record['authors'],
+        'PY': record['year'],
+        'SO': (wos_rec.get('Source Title') if wos_rec else '') or (scopus_rec.get('Source title') if scopus_rec else ''),
+        'DI': record['doi'],
+        'TC': record.get('cited_by', 0),
+        'WC': wos_rec.get('Times Cited, WoS Core', 0) if wos_rec else None,
+        'SC': scopus_rec.get('Cited by', 0) if scopus_rec else None,
+        'AB': (wos_rec.get('Abstract') if wos_rec else '') or (scopus_rec.get('Abstract') if scopus_rec else ''),
+        'DE': (wos_rec.get('Author Keywords') if wos_rec else '') or (scopus_rec.get('Author Keywords') if scopus_rec else ''),
+        'ID_KW': scopus_rec.get('Index Keywords', '') if scopus_rec else '',
+        'PU': (wos_rec.get('Publisher') if wos_rec else '') or (scopus_rec.get('Publisher') if scopus_rec else ''),
+        'SRC': '; '.join(record.get('sources', [])),
+        'UT': wos_rec.get('UT (Unique WOS ID)', '') if wos_rec else '',
+        'EID': scopus_rec.get('EID', '') if scopus_rec else ''
+    }
+    bibliometric_data.append(prepared_record)
+
+# Convert to DataFrame for easier analysis
+df_bibliometric = pd.DataFrame(bibliometric_data)
+
+# Generate summary statistics
+print("\nGenerating summary statistics...")
+
+summary = {
+    'original_records': {
+        'wos': len(wos_df),
+        'scopus': len(scopus_df),
+        'total': len(wos_df) + len(scopus_df)
+    },
+    'duplicates_removed': len(wos_df) + len(scopus_df) - len(merged_records),
+    'final_merged': len(merged_records),
+    'in_both_sources': sum(1 for r in merged_records if len(r.get('sources', [])) > 1)
+}
+
+# Year distribution
+year_dist = df_bibliometric['PY'].value_counts().sort_index()
+summary['year_distribution'] = year_dist.to_dict()
+
+# Source distribution
+source_dist = {'WoS Only': 0, 'Scopus Only': 0, 'Both': 0}
+for src in df_bibliometric['SRC']:
+    if 'WoS' in src and 'Scopus' in src:
+        source_dist['Both'] += 1
+    elif 'WoS' in src:
+        source_dist['WoS Only'] += 1
+    elif 'Scopus' in src:
+        source_dist['Scopus Only'] += 1
+summary['source_distribution'] = source_dist
+
+# Top cited papers
+top_cited = df_bibliometric[df_bibliometric['TC'] > 0].nlargest(10, 'TC')[['TI', 'AU', 'PY', 'TC', 'SRC']]
+summary['top_cited'] = top_cited.to_dict('records')
+
+# Visualize results
+print("\nCreating visualizations...")
+
+# Create visualizations
+fig = make_subplots(rows=2, cols=2, 
+                    subplot_titles=('Records Distribution', 'Source Distribution', 
+                                  'Year Distribution', 'Citation Distribution'))
+
+# Records distribution
+labels = ['Web of Science', 'Scopus', 'Merged Dataset', 'Duplicates']
+values = [summary['original_records']['wos'], 
+          summary['original_records']['scopus'], 
+          summary['final_merged'], 
+          summary['duplicates_removed']]
+fig.add_trace(go.Bar(x=labels, y=values, name='Records', 
+                     marker_color=['#4e79a7', '#f28e2c', '#59a14f', '#e15759']),
+              row=1, col=1)
+
+# Source distribution
+src_labels = list(source_dist.keys())
+src_values = list(source_dist.values())
+fig.add_trace(go.Bar(x=src_labels, y=src_values, name='Sources',
+                     marker_color=['#4e79a7', '#59a14f', '#e15759']),
+              row=1, col=2)
+
+# Year distribution
+years = sorted(year_dist.index)[-10:]  # Last 10 years
+year_counts = [year_dist.get(year, 0) for year in years]
+fig.add_trace(go.Bar(x=years, y=year_counts, name='Years',
+                     marker_color='#59a14f'),
+              row=2, col=1)
+
+# Citation distribution (histogram)
+citations = df_bibliometric[df_bibliometric['TC'] > 0]['TC']
+fig.add_trace(go.Histogram(x=citations, name='Citations', 
+                           marker_color='#4e79a7'),
+              row=2, col=2)
+
+fig.update_layout(height=1000, width=1200, title_text="Bibliometric Analysis Summary", showlegend=False)
+fig.show()
+
+# Create summary text
+summary_text = f"""
+BIBLIOMETRIC DATA PROCESSING SUMMARY
+====================================
+
+Original Records:
+----------------
+Web of Science: {summary['original_records']['wos']}
+Scopus: {summary['original_records']['scopus']}
+Total: {summary['original_records']['total']}
+
+Deduplication Results:
+---------------------
+Duplicates removed: {summary['duplicates_removed']}
+Final merged records: {summary['final_merged']}
+Records in both sources: {summary['in_both_sources']}
+
+Source Distribution:
+-------------------
+WoS Only: {source_dist['WoS Only']}
+Scopus Only: {source_dist['Scopus Only']}
+Both sources: {source_dist['Both']}
+
+Top 5 Most Cited Papers:
+-----------------------
+"""
+
+for i, paper in enumerate(summary['top_cited'][:5], 1):
+    summary_text += f"""
+{i}. {paper['TI']}
+   Authors: {paper['AU']}
+   Year: {paper['PY']}
+   Citations: {paper['TC']}
+   Sources: {paper['SRC']}
+"""
+
+print(summary_text)
+
+# Save files
+print("\nSaving files...")
+
+# Save standardized CSV
+df_bibliometric.to_csv('bibliometric_merged.csv', index=False)
+
+# Save JSON with all data
+output_json = {
+    'data': bibliometric_data,
+    'summary': summary,
+    'metadata': {
+        'processing_date': pd.Timestamp.now().isoformat(),
+        'source_files': [wos_file, scopus_file]
+    }
+}
+
+with open('bibliometric_data.json', 'w') as f:
+    json.dump(output_json, f, indent=2)
+
+# Save summary
+with open('bibliometric_summary.txt', 'w') as f:
+    f.write(summary_text)
+
+# Download files
+print("\nDownloading files...")
+files.download('bibliometric_merged.csv')
+files.download('bibliometric_data.json')
+files.download('bibliometric_summary.txt')
+
+print("\nProcessing complete! Files downloaded successfully.")
+print("\nField abbreviations:")
+print("ID = Identifier, TI = Title, AU = Authors, PY = Year, SO = Source/Journal")
+print("DI = DOI, TC = Total Citations, WC = WoS Citations, SC = Scopus Citations")
+print("AB = Abstract, DE = Author Keywords, ID_KW = Index Keywords, PU = Publisher")
+print("SRC = Source databases, UT = WoS ID, EID = Scopus ID")
