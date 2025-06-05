@@ -11,8 +11,7 @@ Improvements:
 - Generates KG views colored by Type, Community, and Topic.
 - Enhanced visualization function with filtering and better node representation.
 - Added string escaping to prevent JSONDecodeError during pyvis HTML generation.
-- Added download for NLTK 'punkt_tab' resource to fix sentence tokenization errors.
-- FIX v3.2.5: Corrected community detection call (community_louvain.best_partition).
+- Removed invalid NLTK "punkt_tab" resource download.
 - FIX v3.2.5: Modified Document-Topic plot call to avoid potential 'NoneType' division error.
 - FIX v3.2.5: Enhanced pyvis saving/display logic for robustness & improved string escaping.
 - NEW v3.2.6: Added 'max_nodes_to_display' parameter to show_interactive_kg to limit nodes by degree.
@@ -158,7 +157,6 @@ try:
     download_nltk_data('corpora/wordnet')
     download_nltk_data('corpora/stopwords')
     download_nltk_data('tokenizers/punkt')
-    download_nltk_data('tokenizers/punkt_tab')   # <<< FIX: Added punkt_tab download
 except Exception as e:
     print(f"❌ ERROR: NLTK download failed: {e}. Subsequent steps might fail.")
     # Decide if you want to stop: raise SystemExit("NLTK download failed.")
@@ -1833,7 +1831,31 @@ else:
 print("-" * 30, "\n")
 
 
+### --- Section 12b: vLLM Knowledge Graph (Optional) --- ###
+print("--- Section 12b: Generating Knowledge Graph with vLLM (Optional) ---")
+try:
+    from vllm import LLM, SamplingParams
+    VLLM_AVAILABLE = True
+except Exception as e_vllm:
+    print(f"vLLM library not available: {e_vllm}")
+    VLLM_AVAILABLE = False
+
+if VLLM_AVAILABLE and ("pdf_contents_cleaned_kg" in locals() and pdf_contents_cleaned_kg):
+    llm = LLM(model="Metin/Gemma-2-2B-TR-Knowledge-Graph")
+    sampling_params = SamplingParams(temperature=0.1, max_tokens=4096)
+    combined_text = "\n\n".join(pdf_contents_cleaned_kg.values())
+    conversation = [{"role": "user", "content": combined_text + "\n<knowledge_graph>"}]
+    outputs = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
+    try:
+        vllm_result = json.loads(outputs[0].outputs[0].text)
+        print("vLLM Knowledge Graph Result:")
+        print(vllm_result)
+    except Exception as e_parse:
+        print(f"Could not parse vLLM output: {e_parse}")
+else:
+    print("Skipping vLLM Knowledge Graph generation (missing vLLM or text).")
 ### --- Step 13: Graph-Mind API Knowledge Graph (Optional) --- ###
+
 print("--- Section 13: Generating Knowledge Graph with Graph-Mind API (Optional) ---")
 
 run_graph_mind = False # Default to False

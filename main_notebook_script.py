@@ -33,6 +33,16 @@ def print_basic_statistics(dataframe):
     print("\nDescriptive statistics (first 5 rows):")
     print(dataframe.head())
 
+# Actual extract_keywords function definition
+def extract_keywords(keyword_str):
+    if pd.isna(keyword_str):
+        return []
+    # Keywords are expected to be semicolon-separated
+    keywords = [kw.strip() for kw in str(keyword_str).split(";")]
+    # Standardize keywords using the new standardize_text function
+    keywords = [standardize_text(kw) for kw in keywords if kw.strip()]
+    return keywords
+
 # --- Main script execution ---
 if __name__ == '__main__':
     # Simulating notebook execution flow
@@ -85,7 +95,7 @@ if __name__ == '__main__':
     papers['TI_standardized'] = papers['Standardized_TI']
 
     # The old standardization line:
-    # papers['TI_standardized'] = papers['TI'].fillna('').apply(standardize_terms) # This line is now removed.
+    # papers['TI_standardized'] = papers['TI'].fillna('').apply(standardize_text) # This line is now removed.
 
     citation_net = nx.Graph()
     similarity_threshold = 3  # minimum shared keywords
@@ -127,15 +137,6 @@ if __name__ == '__main__':
 
     print("\n--- End of initial script simulation ---")
 
-# Actual extract_keywords function definition
-def extract_keywords(keyword_str):
-    if pd.isna(keyword_str):
-        return []
-    # Keywords are expected to be semicolon-separated
-    keywords = [kw.strip() for kw in str(keyword_str).split(';')]
-    # Standardize keywords using the new standardize_text function
-    keywords = [standardize_text(kw) for kw in keywords if kw.strip()] # Filter out empty strings
-    return keywords
 
 # Example of how other functions might be defined or used later
 # df['Keywords_AB'] = extract_keywords(df['Standardized_AB'] if 'Standardized_AB' in df else df['AB'])
