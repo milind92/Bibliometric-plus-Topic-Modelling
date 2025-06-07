@@ -1854,6 +1854,64 @@ if VLLM_AVAILABLE and ("pdf_contents_cleaned_kg" in locals() and pdf_contents_cl
         print(f"Could not parse vLLM output: {e_parse}")
 else:
     print("Skipping vLLM Knowledge Graph generation (missing vLLM or text).")
+
+### --- Section 12c: HuggingFace Token Classification KG (Optional) --- ###
+print("--- Section 12c: Generating Knowledge Graph with HuggingFace Token Classification Model (Optional) ---")
+try:
+    from transformers import pipeline
+    HF_AVAILABLE = True
+except Exception as e_hf:
+    print(f"transformers library not available: {e_hf}")
+    HF_AVAILABLE = False
+
+if HF_AVAILABLE and ("pdf_contents_cleaned_kg" in locals() and pdf_contents_cleaned_kg):
+    try:
+        hf_pipe = pipeline(
+            "token-classification",
+            model="CyberPeace-Institute/Cybersecurity-Knowledge-Graph",
+            trust_remote_code=True,
+        )
+        combined_text_hf = "\n\n".join(pdf_contents_cleaned_kg.values())
+        token_results = hf_pipe(combined_text_hf)
+        print(f"Token classification extracted {len(token_results)} tokens. Converting to entities...")
+
+        def merge_token_entities(tokens):
+            entities = []
+            current = None
+            for t in tokens:
+                label = t.get("entity", "").split("-")[-1]
+                word = t.get("word", "")
+                start = t.get("start")
+                if current and current["label"] == label and start is not None and start == current["end"]:
+                    current["text"] += word.replace("##", "")
+                    current["end"] = t.get("end", start)
+                else:
+                    if current:
+                        entities.append({"text": current["text"].strip(), "label": current["label"]})
+                    current = {"text": word, "label": label, "end": t.get("end", start)}
+            if current:
+                entities.append({"text": current["text"].strip(), "label": current["label"]})
+            return entities
+
+        hf_entities = merge_token_entities(token_results)
+        print(f"Merged into {len(hf_entities)} entities.")
+
+        all_sentences_hf = []
+        for s_list in document_sentences.values():
+            all_sentences_hf.extend(s_list)
+
+        hf_relations = extract_relations_kg(all_sentences_hf, hf_entities, filename="HF_KG")
+        knowledge_graph_hf = build_knowledge_graph_kg(hf_entities, hf_relations)
+        show_interactive_kg(
+            knowledge_graph_hf,
+            output_filename="knowledge_graph_hf.html",
+            color_attribute="type",
+            title="Interactive Knowledge Graph (HF)",
+        )
+    except Exception as e_hf_proc:
+        print(f"Error generating KG with HuggingFace model: {e_hf_proc}")
+else:
+    print("Skipping HuggingFace KG generation (missing transformers or text).")
 ### --- Step 13: Graph-Mind API Knowledge Graph (Optional) --- ###
 
 print("--- Section 13: Generating Knowledge Graph with Graph-Mind API (Optional) ---")
